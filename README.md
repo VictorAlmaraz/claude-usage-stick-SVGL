@@ -24,69 +24,66 @@ Navigate by **swiping** (the dots at the bottom show your position; the active o
 pill). The **gear** opens Settings. The thin **coral bar** below the header counts down to the
 next refresh — tapping it refreshes immediately.
 
-### 1. Overview (*Resumo*)
-<img src="assets/screen-overview.jpeg" width="460" align="right" alt="Overview">
+### 1. Now (*Agora*)
 
-- **Overall status chip** (`allowed` / `allowed_warning` / `rejected`), color-coded.
-- **5-hour card** and **7-day card**: large percentage colored by threshold
-  (green < 70 % · amber < 90 % · red ≥ 90 %), a progress bar and a live *"resets in …"*.
-- **Row of Clawd mascots** (Haiku / Sonnet / Opus / Fable): coral = online (they blink and gently
-  bob), gray/translucent = offline.
-<br clear="right">
+- Two big cards: **5-hour window** and **week (7-day) window**.
+- Each card: large percentage and an **18-segment meter** whose lit segments (and the number)
+  slide continuously from **green through amber to red** as the window fills, plus a **large live
+  countdown** to the reset and the **local reset time**.
+- Bottom strip: overall **status chip** (`OK` / `ATENCAO` / `BLOQUEADO`) and, when the
+  [token bridge](#tokens-per-session-optional-bridge) is running, the **real token counts** for
+  the current 5 h window.
 
-### 2. Reset clocks (*Reset*)
-<img src="assets/screen-reset.jpeg" width="460" align="right" alt="Reset clocks">
+### 2. Models (*Modelos*)
 
-- Two cards (5 h and 7 d windows) with a **large countdown** and the **local reset time**
-  (*"resets Mon 18:20"*) — respects the configured timezone.
-- A **status pill** per window.
-<br clear="right">
+- The 4 Clawd mascots (Haiku / Sonnet / Opus / Fable) with a **live status pill** under each one,
+  fed by a **real probe against the API** (one model per refresh cycle, rotating):
+  `OK 0.9s` (green, with latency) · `LIMITADO` (amber, HTTP 429) · `ERRO` (red, 5xx/network) ·
+  `N/D` / `--` (gray). The mascot goes gray when the model is unreachable or under incident.
+- An **incident line** from `status.claude.com` (is the problem you or Anthropic?).
 
-### 3. Models (*Modelos*)
-<img src="assets/screen-models.jpeg" width="460" align="right" alt="Models">
+### 3. 5-hour window (*Janela de 5h*)
 
-- The 4 mascots at large size, with **name** and **online/offline** state.
-- An **incident banner**: *"Active incident — see status.claude.com"* or *"All models OK"*, read
-  from `status.claude.com`. Handy to know whether the problem is you or Anthropic.
-<br clear="right">
+- Custom chart with the **X axis spanning exactly the current 5 h window** (start → reset).
+- Solid coral line = real usage history; **dotted line = projection** at the current burn rate.
+- Plain-language verdict, color-coded: *"At the current rate, runs out at 16:40 (in 1h32m)"*
+  (amber/red) or *"Does NOT run out before the reset (~62%)"* (green).
 
-### 4. Trend (*Tendência*)
-<img src="assets/screen-trend.jpeg" width="460" align="right" alt="Trend">
+### 4. Hourly rhythm (*Ritmo por hora*)
 
-- A **line chart** of recent usage: 5 h (coral) and 7 d (green).
-- A **burn-rate** sentence in plain language: *"Usage stable right now"* or *"At the current
-  rate, the 5 h window fills in ~2h10m"*.
-<br clear="right">
+- **Usage by hour of day**: 24 bars whose height/brightness show which hours burn the most quota;
+  the current hour is highlighted.
+- **Period selector** at the top: **Hoje / 7d / 30d / Tudo** (today, last 7 days, last 30 days,
+  all time). Per-day history is **persisted to flash** (31 days on the device).
 
-### 5. Heatmap
-<img src="assets/screen-heatmap.jpeg" width="460" align="right" alt="Heatmap">
+### Threshold moments (animations)
 
-- **Usage by hour of day**: 24 bars (0 h–23 h) whose height and brightness show **which hours you
-  burn the most quota**. The current hour is highlighted.
-- Accumulates over days and is **persisted to flash** — great for planning big refactors right
-  after a reset.
-<br clear="right">
+Whenever a window crosses **25 % / 50 % / 70 % / 100 %**, a full-screen animated "moment" pops
+up (8 combinations: 4 thresholds × 2 windows): the official pixel-art **Clawd** drops in and
+reacts to the level — relaxed at 25 %, focused with a sweat drop at 50 %, wide-eyed and shaking
+at 70 %, grayed-out with X eyes and a blinking red ring at 100 % — while the percentage counts
+up and a segment meter lights up. Tap to dismiss (auto-closes after ~4.5 s).
 
-### 6. Details (*Detalhes*)
-<img src="assets/screen-details.jpeg" width="460" align="right" alt="Details">
+> **Long-press the Claude Code logo** in the header to preview all 8 animations in sequence.
 
-- Minimalist: **"The limit that will block you first"** → **5 HOURS** or **7 DAYS** (from the
-  `representative-claim` header), plus the **overage** state when relevant.
-<br clear="right">
+The header and the token/loading screens use the **official Claude Code pixel logo** (SVGs in
+`assets/brand/`, converted to embedded LVGL images by `tools/gen_logo_assets.py`).
 
 ### Settings (*Ajustes*)
-<img src="assets/screen-settings.jpeg" width="460" align="right" alt="Settings">
 
-Opened from the gear:
+Opened from the gear (scrollable list, 44 px touch rows):
 
 - **Refresh now** — forces a refresh.
 - **Refresh interval** — 30 s / 1 min / 2 min / 5 min (tap to cycle; saved to NVS).
+- **Slideshow** — auto-advances the screens; tap to cycle **off / 5 s / 10 s / 15 s / 30 s**
+  (pauses for 10 s after any touch).
 - **Timezone: GMT±N** — adjusts the timezone (tap to cycle; fixes the reset clocks).
+- **Brightness** — low / medium / high (backlight PWM).
 - **Configure WiFi** — re-scan + password on screen.
 - **Change token** — reopens the web token entry.
-- **Brightness** — low / medium / high (backlight PWM).
+- **Language** — Portuguese / English, applied to the whole UI (saved to NVS).
+- **About** — device info, display model and developer credits.
 - **Erase everything** — factory reset (2 taps to confirm).
-<br clear="right">
 
 ---
 
@@ -124,7 +121,30 @@ anthropic-ratelimit-unified-fallback-percentage
 anthropic-ratelimit-unified-overage-status / -overage-disabled-reason
 ```
 
-Model health comes from `status.claude.com/api/v2/incidents/unresolved.json`.
+Model health combines `status.claude.com/api/v2/incidents/unresolved.json` (incidents) with a
+**per-model probe**: each refresh cycle the device sends one `max_tokens: 1` request to the next
+model in the rotation (Haiku → Sonnet → Opus → Fable) and records the HTTP code + latency. That's
+what feeds the colored status pills on the Models screen.
+
+### Tokens per session (optional bridge)
+
+The API does **not** expose token counts for subscription accounts — the `unified-*` headers only
+carry utilization percentages, and `/api/oauth/usage` requires the `user:profile` scope (the
+`setup-token` only has `user:inference`) and still returns percentages. The real numbers live in
+the **local Claude Code transcripts** (`~/.claude/projects/**/*.jsonl`).
+
+[`tools/token_bridge.py`](tools/token_bridge.py) (stdlib only) closes that gap: it asks the device
+for the current window (`GET http://claude-stick.local/window`), sums the transcript `usage`
+entries since the window start (deduped by message id) and pushes them back
+(`POST /tokens`). The "Now" screen then shows *"tokens na janela: 1.2M entrada • 88k saida"*.
+
+```bash
+python3 tools/token_bridge.py               # one shot
+python3 tools/token_bridge.py --loop 120    # keep pushing every 2 min
+```
+
+The device advertises itself via mDNS as **`claude-stick.local`** while the dashboard is open. If
+the row disappears, the data just went stale (> 15 min without a push).
 
 ### Generating the token (`claude setup-token`)
 

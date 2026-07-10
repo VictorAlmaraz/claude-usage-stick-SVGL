@@ -2,12 +2,16 @@
  * Claude Usage Stick — tela touch LVGL
  * Placa: Guition JC4832W535 (ESP32-S3, AXS15231B QSPI), 480x320 paisagem.
  *
- * Mostra o uso de rate-limit do Claude Code (janelas 5h e 7d) lido dos headers
- * da api.anthropic.com, mais a saúde dos modelos (status.claude.com) numa
- * fileira de mascotes. Token OAuth digitado na tela e guardado cifrado
- * (AES-256-GCM, chave derivada de um PIN de 4 dígitos).
+ * Dashboard do rate-limit do Claude Code (janelas 5h e 7d, headers unified-*),
+ * sonda real por modelo (latencia + HTTP), projecao de esgotamento da janela
+ * 5h e ritmo de uso por hora com filtro de periodo. Token OAuth digitado na
+ * tela e guardado cifrado (AES-256-GCM, chave derivada de um PIN de 4 digitos).
  *
- * Sem botão físico: navegação 100% touch.
+ * Tokens por sessao: a API nao expoe contagem para conta de assinatura; um
+ * bridge opcional (tools/token_bridge.py) soma os transcripts locais do
+ * Claude Code e faz POST /tokens neste device (mDNS claude-stick.local).
+ *
+ * Sem botao fisico: navegacao 100% touch (swipe entre telas + slideshow).
  * Init de display/touch validado no bring-up (ver REFERENCIA-HARDWARE-LVGL.md).
  */
 #include <Arduino.h>
@@ -16,6 +20,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <time.h>
@@ -26,18 +31,26 @@
 #include "api.h"
 #include "status.h"
 #include "crypto.h"
+#include "logo_assets.h"   // Clawd + logotipo oficiais (gerado por tools/gen_logo_assets.py)
 
-// ---- Paleta (tema escuro, acento coral do Claude) ----
-#define C_BG       0x0E0E10
-#define C_SURFACE  0x1A1A1E
-#define C_SURFACE2 0x24242A
-#define C_BORDER   0x33333A
-#define C_TEXT     0xECECEC
-#define C_MUTED    0x9A9AA2
+// ---- Paleta (escuro, minimalista; acento coral do Claude) ----
+#define C_BG       0x0F0F12
+#define C_SURFACE  0x1A1A20   // cards sem borda
+#define C_SURFACE2 0x24242C   // teclas / botoes secundarios
+#define C_TRACK    0x26262E   // trilho de barras
+#define C_GRID     0x232329   // linhas de grade dentro de cards
+#define C_BORDER   0x30303A   // hairlines raras
+#define C_TEXT     0xF2F0EC
+#define C_MUTED    0x8C8C98
+#define C_FAINT    0x5C5C68
 #define C_ACCENT   0xD97757   // coral Claude
-#define C_OK       0x22C55E
-#define C_WARN     0xF59E0B
-#define C_BAD      0xEF4444
+#define C_OK       0x4ADE80
+#define C_WARN     0xFBBF24
+#define C_BAD      0xF87171
+
+// ---- Idioma (0 = portugues, 1 = english; Ajustes -> NVS "lang") ----
+static uint8_t g_lang = 0;
+#define TRS(pt, en) (g_lang ? (en) : (pt))
 
 // ---- Hardware ----
 Arduino_Canvas *gfx = nullptr;
@@ -49,7 +62,7 @@ Preferences g_prefs;
 // ---- Estado da aplicação ----
 enum State {
   ST_BOOT, ST_PIN, ST_SETUP_PIN, ST_WIFI, ST_TOKEN,
-  ST_LOADING, ST_MAIN, ST_SETTINGS, ST_ERROR
+  ST_LOADING, ST_MAIN, ST_SETTINGS, ST_ABOUT, ST_ERROR
 };
 static State g_state = ST_BOOT;
 static State g_pending = ST_BOOT;
@@ -57,8 +70,24 @@ static bool  g_dirty = false;
 static void request_state(State s) { g_pending = s; g_dirty = true; }
 
 // ---- Dados ----
-static UsageData   g_usage = {0, 0, 0, 0, false, ""};
+static UsageData   g_usage = {};
 static ModelStatus g_status = {true, true, true, true, false};
+
+// ---- Modelos sondados (1 por ciclo, rotativo) ----
+#define NMODELS 4
+struct ModelInfo { const char *name; const char *id; ProbeResult pr; uint32_t atMs; };
+static ModelInfo g_models[NMODELS] = {
+  {"Haiku",  "claude-haiku-4-5-20251001", {0, 0}, 0},
+  {"Sonnet", "claude-sonnet-5",           {0, 0}, 0},
+  {"Opus",   "claude-opus-4-8",           {0, 0}, 0},
+  {"Fable",  "claude-fable-5",            {0, 0}, 0},
+};
+static int g_probeIdx = 0;
+
+// ---- Tokens por sessao (vindos do bridge via POST /tokens) ----
+struct TokenStats { long long tin, tout, cache; int sessions; uint32_t atMs; };
+static TokenStats g_tok = {0, 0, 0, 0, 0};
+#define TOK_FRESH_MS (15UL * 60UL * 1000UL)
 
 // ---- Token / segurança ----
 static EncryptedBlob g_blob;
@@ -87,41 +116,57 @@ static int g_briIdx = 1;
 static uint32_t g_lastPollMs = 0;         // millis do último poll (p/ barra de refresh)
 static int g_pollSec = DEFAULT_POLL_SEC;  // intervalo de atualização (config, NVS)
 static int g_tzOffset = -3;               // fuso GMT (horas), config NVS
+static int g_slideSec = 0;                // slideshow: 0=off, 5/10/15/30s (config, NVS)
+static int g_heatMode = 3;                // 0=hoje 1=7d 2=30d 3=tudo (config, NVS)
+static uint32_t g_lastTouchMs = 0;        // ultimo toque (pausa o slideshow)
+static uint32_t g_lastSlideMs = 0;
 
 // ---- Histórico (ring buffer; persistido em LittleFS) ----
-#define HIST_MAX 120
+#define HIST_MAX 160
 struct Sample { uint32_t t; uint8_t h5; uint8_t d7; };   // t = epoch (0 = relógio não sincronizado)
 static Sample g_hist[HIST_MAX];
 static int g_histN = 0;
 static int g_histHead = 0;
-static float g_hourBurn[24] = {0};   // consumo por hora do dia (heatmap)
+static float g_hourBurn[24] = {0};   // consumo por hora do dia (todo o tempo)
 static float g_lastH5 = -1.0f;       // última utilização 5h (delta do heatmap)
 
-// ---- Mascotes Clawd (corpo + braços/pernas; animados) ----
-struct Mascot { lv_obj_t *cont, *eye[2]; int baseY, eyeH; bool up; };
-static Mascot g_masc[8];
+// ---- Heatmap por dia (para o filtro hoje/7d/30d) ----
+#define NDAYS 31
+struct DayHeat { uint32_t day; float burn[24]; };   // day = dias locais desde epoch
+static DayHeat g_days[NDAYS];
+static int g_dayN = 0;
+
+// ---- Mascotes Clawd oficiais (pagina de modelos; humor por status) ----
+// mood: 0=nunca sondado, 1=ok, 2=limitado(429), 3=erro/incidente, 4=n/d(404)
+struct Mascot { lv_obj_t *cont, *img, *lid[2], *drop; int baseY, mood; };
+static Mascot g_masc[NMODELS];
 static int g_mascN = 0;
+static lv_point_precise_t g_mXPts[NMODELS][4][2];   // olhos em X (mood 3)
 
 // ---- Ponteiros de UI do dashboard (zerados a cada build de ST_MAIN) ----
-#define NTILES 6
+#define NTILES 4
+#define NSEG 18                       // segmentos do medidor de janela
 struct DashUI {
   lv_obj_t *tv, *tile[NTILES], *dots[NTILES];
-  lv_obj_t *refBar, *hdrChip;
-  // overview
-  lv_obj_t *ovChip, *ovPct5, *ovBar5, *ovEta5, *ovPct7, *ovBar7, *ovEta7;
-  // reset clocks
-  lv_obj_t *rcBig5, *rcAt5, *rcChip5, *rcBig7, *rcAt7, *rcChip7;
-  // models
-  lv_obj_t *incident;
-  // tendência
-  lv_obj_t *chart, *burn; lv_chart_series_t *ser5, *ser7;
-  // heatmap por hora
-  lv_obj_t *heat[24];
-  // detalhes (minimalista)
-  lv_obj_t *dvClaim, *dvOverage;
+  lv_obj_t *refBar;
+  // agora (overview + reset mesclados)
+  lv_obj_t *agChip, *agPct5, *agCd5, *agAt5;
+  lv_obj_t *agPct7, *agCd7, *agAt7, *agTok;
+  lv_obj_t *seg5[NSEG], *seg7[NSEG];  // medidores segmentados
+  // modelos
+  lv_obj_t *mChip[NMODELS], *incident;
+  // tendência da janela 5h (linhas custom)
+  lv_obj_t *trHist, *trProj, *trDot, *trCap, *trT0, *trT1;
+  // ritmo por hora
+  lv_obj_t *heat[24], *heatBtn[4];
 };
 static DashUI g_ui;
 static lv_obj_t *g_pinDots = nullptr, *g_pinMsg = nullptr;
+static int g_curTile = 0;
+
+// pontos das linhas do gráfico de tendência (precisam persistir)
+static lv_point_precise_t g_trPts[HIST_MAX];
+static lv_point_precise_t g_trProjPts[2];
 
 // ---- Forward declarations ----
 static void render_state();
@@ -137,6 +182,13 @@ static void ui_main();
 static void ui_settings();
 static void ui_message(const char *title, const char *sub, uint32_t color);
 static void nav_cb(lv_event_t *e);
+static void start_data_web();
+static void trend_redraw();
+static void heat_redraw();
+static void update_tok_row();
+static void show_moment(int win, int thr);
+static void moment_tick();
+static void moment_close();
 
 // ============================================================
 // Pipeline de display/touch (validado no bring-up)
@@ -157,6 +209,7 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
     touch_dev.readData(&x, &y);
     data->point.x = x; data->point.y = y;
     data->state = LV_INDEV_STATE_PRESSED;
+    g_lastTouchMs = millis();          // pausa o slideshow enquanto ha interacao
   } else {
     data->state = LV_INDEV_STATE_RELEASED;
   }
@@ -178,23 +231,13 @@ static void no_box(lv_obj_t *o) {
   lv_obj_set_style_pad_all(o, 0, 0);
   lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
 }
-static lv_obj_t *mkcard(lv_obj_t *p, int w, int h) {
-  lv_obj_t *c = lv_obj_create(p);
-  lv_obj_set_size(c, w, h);
-  lv_obj_set_style_bg_color(c, lv_color_hex(C_SURFACE), 0);
-  lv_obj_set_style_border_color(c, lv_color_hex(C_BORDER), 0);
-  lv_obj_set_style_border_width(c, 1, 0);
-  lv_obj_set_style_radius(c, 12, 0);
-  lv_obj_set_style_pad_all(c, 12, 0);
-  lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-  return c;
-}
 // Botão pílula com label centralizado; user_data leva o State alvo (nav_cb).
 static lv_obj_t *mkbtn(lv_obj_t *p, const char *txt, const lv_font_t *font,
                        uint32_t bg, uint32_t fg) {
   lv_obj_t *b = lv_button_create(p);
   lv_obj_set_style_bg_color(b, lv_color_hex(bg), 0);
   lv_obj_set_style_radius(b, 10, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
   lv_obj_center(mklabel(b, txt, font, fg));
   return b;
 }
@@ -203,18 +246,58 @@ static uint32_t pct_color(float p) {
   if (p < 90.0f) return C_WARN;
   return C_BAD;
 }
+// gradiente contínuo verde -> âmbar -> vermelho conforme o uso cresce
+static lv_color_t grad_color(float p) {
+  if (p < 0) p = 0; if (p > 100) p = 100;
+  if (p <= 50.0f)
+    return lv_color_mix(lv_color_hex(C_WARN), lv_color_hex(C_OK), (uint8_t)(p * 255.0f / 50.0f));
+  return lv_color_mix(lv_color_hex(C_BAD), lv_color_hex(C_WARN), (uint8_t)((p - 50.0f) * 255.0f / 50.0f));
+}
+// acende os segmentos do medidor; acesos ganham a cor do gradiente,
+// apagados ficam no trilho escuro
+static void set_meter(lv_obj_t **seg, float pct) {
+  int filled = (int)(pct / 100.0f * NSEG + 0.5f);
+  if (pct > 0.5f && filled == 0) filled = 1;
+  if (filled > NSEG) filled = NSEG;
+  lv_color_t col = grad_color(pct);
+  for (int i = 0; i < NSEG; i++) {
+    if (!seg[i]) continue;
+    lv_obj_set_style_bg_color(seg[i], (i < filled) ? col : lv_color_hex(C_TRACK), 0);
+    lv_obj_set_style_bg_opa(seg[i], (i < filled) ? LV_OPA_COVER : 160, 0);
+  }
+}
 // "reseta em 1h 23m" / "2d 4h" / "agora" / "--" (relógio não sincronizado)
 static void fmt_eta(uint32_t epoch, char *out, int sz) {
   time_t now = time(nullptr);
   if (now < 1000000000L || epoch == 0) { snprintf(out, sz, "--"); return; }
   long d = (long)epoch - (long)now;
-  if (d <= 0) { snprintf(out, sz, "agora"); return; }
+  if (d <= 0) { snprintf(out, sz, "%s", TRS("agora", "now")); return; }
   int days = d / 86400; d %= 86400;
   int hrs  = d / 3600;  d %= 3600;
   int mins = d / 60;
   if (days > 0)      snprintf(out, sz, "%dd %dh", days, hrs);
   else if (hrs > 0)  snprintf(out, sz, "%dh %02dm", hrs, mins);
   else               snprintf(out, sz, "%dm", mins);
+}
+static void fmt_clock(uint32_t epoch, char *out, int sz) {
+  if (epoch == 0 || time(nullptr) < 1000000000L) { strlcpy(out, "--:--", sz); return; }
+  time_t t = (time_t)epoch; struct tm tmv;
+  localtime_r(&t, &tmv);
+  strftime(out, sz, "%a %H:%M", &tmv);
+}
+static void fmt_hm(uint32_t epoch, char *out, int sz) {
+  if (epoch == 0 || time(nullptr) < 1000000000L) { strlcpy(out, "--:--", sz); return; }
+  time_t t = (time_t)epoch; struct tm tmv;
+  localtime_r(&t, &tmv);
+  strftime(out, sz, "%H:%M", &tmv);
+}
+// 1234 -> "1.2k", 2345678 -> "2.3M"
+static void fmt_tok(long long v, char *out, int sz) {
+  if (v >= 100000000LL)     snprintf(out, sz, "%lldM", v / 1000000LL);
+  else if (v >= 1000000LL)  snprintf(out, sz, "%.1fM", v / 1e6);
+  else if (v >= 10000LL)    snprintf(out, sz, "%lldk", v / 1000LL);
+  else if (v >= 1000LL)     snprintf(out, sz, "%.1fk", v / 1e3);
+  else                      snprintf(out, sz, "%lld", v);
 }
 
 // ============================================================
@@ -234,6 +317,12 @@ static void load_persisted() {
   if (g_pollSec < MIN_POLL_SEC || g_pollSec > MAX_POLL_SEC) g_pollSec = DEFAULT_POLL_SEC;
   g_tzOffset = g_prefs.getInt("tz", -3);
   if (g_tzOffset < -12 || g_tzOffset > 14) g_tzOffset = -3;
+  g_slideSec = g_prefs.getInt("slide", 0);
+  if (g_slideSec != 0 && g_slideSec != 5 && g_slideSec != 10 &&
+      g_slideSec != 15 && g_slideSec != 30) g_slideSec = 0;
+  g_heatMode = g_prefs.getInt("heatm", 3);
+  if (g_heatMode < 0 || g_heatMode > 3) g_heatMode = 3;
+  g_lang = g_prefs.getInt("lang", 0) ? 1 : 0;
 }
 static void save_blob() { g_prefs.putBytes("blob", &g_blob, sizeof(EncryptedBlob)); }
 static void save_attempts() { g_prefs.putInt("pinatt", g_pinAttempts); }
@@ -277,7 +366,7 @@ static void pin_submit() {
       g_pinConfirming = true;
       g_pinEntry[0] = 0;
       pin_update_dots();
-      if (g_pinMsg) lv_label_set_text(g_pinMsg, "Confirme o PIN");
+      if (g_pinMsg) lv_label_set_text(g_pinMsg, TRS("Confirme o PIN", "Confirm the PIN"));
       return;
     }
     // confirmando
@@ -285,12 +374,12 @@ static void pin_submit() {
       g_pinConfirming = false;
       g_pinFirst[0] = 0; g_pinEntry[0] = 0;
       pin_update_dots();
-      if (g_pinMsg) lv_label_set_text(g_pinMsg, "Nao bateu. Defina de novo.");
+      if (g_pinMsg) lv_label_set_text(g_pinMsg, TRS("Nao bateu. Defina de novo.", "Didn't match. Set it again."));
       return;
     }
     // PIN definido -> cifra o token pendente e salva
     if (!encryptToken(g_pendingToken, g_pinEntry, g_blob)) {
-      if (g_pinMsg) lv_label_set_text(g_pinMsg, "Falha ao cifrar. Tente de novo.");
+      if (g_pinMsg) lv_label_set_text(g_pinMsg, TRS("Falha ao cifrar. Tente de novo.", "Encryption failed. Try again."));
       g_pinConfirming = false; g_pinFirst[0] = 0; g_pinEntry[0] = 0; pin_update_dots();
       return;
     }
@@ -326,7 +415,7 @@ static void pin_submit() {
     g_lockoutUntil = millis() + (uint32_t)wait * 1000;
     if (g_pinMsg) {
       char m[64];
-      snprintf(m, sizeof(m), "PIN errado (%d/%d). Aguarde %ds",
+      snprintf(m, sizeof(m), TRS("PIN errado (%d/%d). Aguarde %ds", "Wrong PIN (%d/%d). Wait %ds"),
                g_pinAttempts, MAX_PIN_ATTEMPTS, wait);
       lv_label_set_text(g_pinMsg, m);
     }
@@ -357,8 +446,8 @@ static void pin_kb_cb(lv_event_t *e) {
 static void ui_pin() {
   lv_obj_t *scr = lv_screen_active();
   const char *title = (g_state == ST_SETUP_PIN)
-    ? (g_pinConfirming ? "Confirme o PIN" : "Defina um PIN")
-    : "Digite o PIN";
+    ? (g_pinConfirming ? TRS("Confirme o PIN", "Confirm the PIN") : TRS("Defina um PIN", "Set a PIN"))
+    : TRS("Digite o PIN", "Enter the PIN");
   lv_obj_t *t = mklabel(scr, title, &lv_font_montserrat_22, C_TEXT);
   lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 14);
 
@@ -367,8 +456,8 @@ static void ui_pin() {
   pin_update_dots();
 
   const char *sub = (g_state == ST_SETUP_PIN)
-    ? "Voce vai digita-lo a cada boot."
-    : "Necessario para desbloquear o token.";
+    ? TRS("Voce vai digita-lo a cada boot.", "You'll type it on every boot.")
+    : TRS("Necessario para desbloquear o token.", "Needed to unlock the token.");
   g_pinMsg = mklabel(scr, sub, &lv_font_montserrat_14, C_MUTED);
   lv_obj_align(g_pinMsg, LV_ALIGN_TOP_MID, 0, 86);
 
@@ -385,7 +474,7 @@ static void ui_pin() {
 
   if (millis() < g_lockoutUntil && g_pinMsg) {
     int rem = (g_lockoutUntil - millis()) / 1000;
-    char m[48]; snprintf(m, sizeof(m), "Aguarde %ds", rem);
+    char m[48]; snprintf(m, sizeof(m), TRS("Aguarde %ds", "Wait %ds"), rem);
     lv_label_set_text(g_pinMsg, m);
   }
 }
@@ -395,10 +484,11 @@ static void ui_pin() {
 // ============================================================
 static lv_obj_t *wifi_list = nullptr, *wifi_ta = nullptr, *wifi_kb = nullptr, *wifi_status = nullptr;
 static char sel_ssid[33] = {0};
+static void wifi_item_cb(lv_event_t *e);
 
 static void wifi_populate() {
   lv_obj_clean(wifi_list);
-  lv_label_set_text(wifi_status, "Escaneando redes...");
+  lv_label_set_text(wifi_status, TRS("Escaneando redes...", "Scanning networks..."));
   lv_refr_now(NULL);
   WiFiManager::NetworkInfo nets[12];
   int n = g_wifi.scanNetworks(nets, 12);
@@ -408,14 +498,15 @@ static void wifi_populate() {
     lv_obj_set_style_text_color(b, lv_color_hex(C_TEXT), 0);
     lv_obj_add_event_cb(b, wifi_item_cb, LV_EVENT_CLICKED, NULL);  // clique direto no botão
   }
-  lv_label_set_text(wifi_status, n > 0 ? "Toque na sua rede" : "Nenhuma rede. Toque em Reescanear.");
+  lv_label_set_text(wifi_status, n > 0 ? TRS("Toque na sua rede", "Tap your network")
+                                       : TRS("Nenhuma rede. Toque em Reescanear.", "No networks. Tap Rescan."));
 }
 static void wifi_item_cb(lv_event_t *e) {
   lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
   const char *txt = lv_list_get_button_text(wifi_list, btn);
   if (!txt) return;
   strlcpy(sel_ssid, txt, sizeof(sel_ssid));
-  lv_label_set_text_fmt(wifi_status, "Senha de \"%s\":", sel_ssid);
+  lv_label_set_text_fmt(wifi_status, TRS("Senha de \"%s\":", "Password for \"%s\":"), sel_ssid);
   lv_obj_add_flag(wifi_list, LV_OBJ_FLAG_HIDDEN);
   lv_textarea_set_text(wifi_ta, "");
   lv_obj_clear_flag(wifi_ta, LV_OBJ_FLAG_HIDDEN);
@@ -426,33 +517,34 @@ static void wifi_kb_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_READY) {
     const char *pass = lv_textarea_get_text(wifi_ta);
-    lv_label_set_text(wifi_status, "Conectando...");
+    lv_label_set_text(wifi_status, TRS("Conectando...", "Connecting..."));
     lv_obj_add_flag(wifi_kb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_ta, LV_OBJ_FLAG_HIDDEN);
     lv_refr_now(NULL);
     bool ok = g_wifi.connectTo(sel_ssid, pass, 15000);
     if (ok) request_state(g_onboarding ? ST_TOKEN : ST_LOADING);
-    else { lv_label_set_text(wifi_status, "Falhou. Toque numa rede de novo."); lv_obj_clear_flag(wifi_list, LV_OBJ_FLAG_HIDDEN); }
+    else { lv_label_set_text(wifi_status, TRS("Falhou. Toque numa rede de novo.", "Failed. Tap a network again.")); lv_obj_clear_flag(wifi_list, LV_OBJ_FLAG_HIDDEN); }
   } else if (code == LV_EVENT_CANCEL) {
     lv_obj_add_flag(wifi_kb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_ta, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(wifi_list, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(wifi_status, "Toque na sua rede");
+    lv_label_set_text(wifi_status, TRS("Toque na sua rede", "Tap your network"));
   }
 }
 static void wifi_rescan_cb(lv_event_t *e) { (void)e; wifi_populate(); }
 
 static void ui_wifi() {
   lv_obj_t *scr = lv_screen_active();
-  lv_obj_t *title = mklabel(scr, "Configurar WiFi", &lv_font_montserrat_20, C_TEXT);
+  lv_obj_t *title = mklabel(scr, TRS("Configurar WiFi", "Configure WiFi"), &lv_font_montserrat_20, C_TEXT);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 12);
 
-  lv_obj_t *rb = mkbtn(scr, "Reescanear", &lv_font_montserrat_14, C_SURFACE2, C_ACCENT);
+  lv_obj_t *rb = mkbtn(scr, TRS("Reescanear", "Rescan"), &lv_font_montserrat_14, C_SURFACE2, C_ACCENT);
   lv_obj_align(rb, LV_ALIGN_TOP_RIGHT, -12, 8);
   lv_obj_add_event_cb(rb, wifi_rescan_cb, LV_EVENT_CLICKED, NULL);
 
   if (!g_onboarding && g_hasToken) {
-    lv_obj_t *bk = mkbtn(scr, LV_SYMBOL_LEFT " Voltar", &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
+    lv_obj_t *bk = mkbtn(scr, TRS(LV_SYMBOL_LEFT " Voltar", LV_SYMBOL_LEFT " Back"),
+                         &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
     lv_obj_align(bk, LV_ALIGN_TOP_RIGHT, -150, 8);
     lv_obj_add_event_cb(bk, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(g_usage.ok ? ST_MAIN : ST_SETTINGS));
   }
@@ -470,7 +562,7 @@ static void ui_wifi() {
   wifi_ta = lv_textarea_create(scr);
   lv_textarea_set_one_line(wifi_ta, true);
   lv_textarea_set_password_mode(wifi_ta, true);
-  lv_textarea_set_placeholder_text(wifi_ta, "senha do WiFi");
+  lv_textarea_set_placeholder_text(wifi_ta, TRS("senha do WiFi", "WiFi password"));
   lv_obj_set_size(wifi_ta, 452, 44);
   lv_obj_align(wifi_ta, LV_ALIGN_TOP_MID, 0, 66);
   lv_obj_add_flag(wifi_ta, LV_OBJ_FLAG_HIDDEN);
@@ -483,51 +575,44 @@ static void ui_wifi() {
 }
 
 // ============================================================
-// Tela: token OAuth via WEB (cola do navegador na rede local)
-// Digitar 100+ chars no touch é inviável -> sobe um WebServer e o usuário
-// cola o token pelo PC/celular. Ao salvar, o device VALIDA com fetchUsage.
+// WebServer: token (onboarding) + dados (bridge de tokens)
 // ============================================================
 static WebServer *g_web = nullptr;
 static volatile bool g_tokenGot = false;
 static lv_obj_t *g_tokMsg = nullptr;            // status na tela do device
-static lv_point_precise_t g_markPts[6][2];      // pontos do "sol" do Claude (persistem)
 
 static void stop_web() { if (g_web) { g_web->stop(); delete g_web; g_web = nullptr; } }
 
+static bool g_mdnsUp = false;
+static void ensure_mdns() {
+  if (g_mdnsUp || !g_wifi.isConnected()) return;
+  if (MDNS.begin("claude-stick")) {
+    MDNS.addService("http", "tcp", 80);
+    g_mdnsUp = true;
+    Serial.println("[MDNS] claude-stick.local");
+  }
+}
+
 static void anim_opa_cb(void *o, int32_t v) { lv_obj_set_style_opa((lv_obj_t *)o, (lv_opa_t)v, 0); }
 
-// Ícone do Claude: "sol" de 12 raios (6 diâmetros) em coral, com respiração.
-static lv_obj_t *build_claude_mark(lv_obj_t *parent, int size) {
-  lv_obj_t *c = lv_obj_create(parent);
-  lv_obj_set_size(c, size, size);
-  no_box(c);
-  int cx = size / 2, cy = size / 2, r = size / 2 - 3;
-  static const float ang[6] = {0, 30, 60, 90, 120, 150};
-  for (int k = 0; k < 6; k++) {
-    float a = ang[k] * 3.14159265f / 180.0f;
-    int dx = (int)(r * cosf(a)), dy = (int)(r * sinf(a));
-    g_markPts[k][0].x = cx - dx; g_markPts[k][0].y = cy - dy;
-    g_markPts[k][1].x = cx + dx; g_markPts[k][1].y = cy + dy;
-    lv_obj_t *ln = lv_line_create(c);
-    lv_line_set_points(ln, g_markPts[k], 2);
-    lv_obj_set_style_line_width(ln, size / 8, 0);
-    lv_obj_set_style_line_color(ln, lv_color_hex(C_ACCENT), 0);
-    lv_obj_set_style_line_rounded(ln, true, 0);
-  }
+// Clawd oficial (pixel-art) com "respiração" — substitui o antigo sol de raios.
+static lv_obj_t *build_claude_mark(lv_obj_t *parent) {
+  lv_obj_t *img = lv_image_create(parent);
+  lv_image_set_src(img, &img_clawd_big);
   lv_anim_t a; lv_anim_init(&a);
-  lv_anim_set_var(&a, c);
+  lv_anim_set_var(&a, img);
   lv_anim_set_exec_cb(&a, anim_opa_cb);
-  lv_anim_set_values(&a, 110, 255);
+  lv_anim_set_values(&a, 140, 255);
   lv_anim_set_duration(&a, 900);
   lv_anim_set_playback_duration(&a, 900);
   lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
   lv_anim_start(&a);
-  return c;
+  return img;
 }
 
 // ---- páginas HTML ----
 #define WEB_CSS \
-  ":root{--bg:#0E0E10;--card:#1A1A1E;--bd:#33333A;--tx:#ECECEC;--mut:#9A9AA2;--cor:#D97757}" \
+  ":root{--bg:#0F0F12;--card:#1A1A20;--bd:#30303A;--tx:#F2F0EC;--mut:#8C8C98;--cor:#D97757}" \
   "*{box-sizing:border-box}" \
   "body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,Segoe UI,Roboto,sans-serif;" \
   "display:flex;min-height:100vh;align-items:center;justify-content:center}" \
@@ -536,7 +621,7 @@ static lv_obj_t *build_claude_mark(lv_obj_t *parent, int size) {
   "p{color:var(--mut);font-size:14px;line-height:1.5;margin:6px 0 14px}" \
   "textarea{width:100%;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:10px;" \
   "padding:12px;font-family:ui-monospace,monospace;font-size:13px;min-height:96px;resize:vertical}" \
-  "button{margin-top:14px;width:100%;background:var(--cor);color:#1A1A1E;border:0;border-radius:10px;" \
+  "button{margin-top:14px;width:100%;background:var(--cor);color:#1A1A20;border:0;border-radius:10px;" \
   "padding:14px;font-size:16px;font-weight:700;cursor:pointer}" \
   ".spark{width:26px;height:26px;flex:0 0 auto}code,a{color:var(--cor)}"
 
@@ -582,27 +667,76 @@ static void handleTokenPost() {
   String t = g_web->arg("token");
   t.trim();
   if (t.length() < 8) {
-    if (g_tokMsg) lv_label_set_text(g_tokMsg, "token vazio");
+    if (g_tokMsg) lv_label_set_text(g_tokMsg, TRS("token vazio", "empty token"));
     g_web->send(200, "text/html; charset=utf-8", web_result(false, "Token vazio ou muito curto."));
     return;
   }
   // feedback no device antes da chamada bloqueante
-  if (g_tokMsg) { lv_label_set_text(g_tokMsg, "validando token..."); lv_refr_now(NULL); }
+  if (g_tokMsg) { lv_label_set_text(g_tokMsg, TRS("validando token...", "validating token...")); lv_refr_now(NULL); }
 
-  UsageData tmp = {0, 0, 0, 0, false, ""};
+  UsageData tmp = {};
   bool ok = fetchUsage(t.c_str(), tmp);
   if (ok) {
     strlcpy(g_pendingToken, t.c_str(), sizeof(g_pendingToken));
     g_usage = tmp;                              // já temos dados p/ o dashboard
     g_pinConfirming = false; g_pinFirst[0] = 0; g_pinEntry[0] = 0;
     g_tokenGot = true;                          // loop -> ST_SETUP_PIN
-    if (g_tokMsg) lv_label_set_text(g_tokMsg, "token OK! defina o PIN");
+    if (g_tokMsg) lv_label_set_text(g_tokMsg, TRS("token OK! defina o PIN", "token OK! set the PIN"));
     g_web->send(200, "text/html; charset=utf-8", web_result(true, ""));
   } else {
     String m = String("A API recusou o token (") + tmp.error + "). Confira e cole de novo.";
-    if (g_tokMsg) lv_label_set_text(g_tokMsg, "token recusado, tente de novo");
+    if (g_tokMsg) lv_label_set_text(g_tokMsg, TRS("token recusado, tente de novo", "token rejected, try again"));
     g_web->send(200, "text/html; charset=utf-8", web_result(false, m));
   }
+}
+
+// ---- Endpoints de dados (bridge de tokens; ver tools/token_bridge.py) ----
+static long long jll(const String &s, const char *key) {
+  String k = String("\"") + key + "\"";
+  int i = s.indexOf(k); if (i < 0) return 0;
+  i = s.indexOf(':', i + k.length() - 1); if (i < 0) return 0;
+  return atoll(s.c_str() + i + 1);
+}
+static void handleWindow() {
+  char b[192];
+  snprintf(b, sizeof(b),
+           "{\"now\":%lu,\"h5_reset\":%lu,\"d7_reset\":%lu,\"h5_util\":%.4f,\"d7_util\":%.4f}",
+           (unsigned long)time(nullptr),
+           (unsigned long)g_usage.h5ResetEpoch, (unsigned long)g_usage.d7ResetEpoch,
+           g_usage.h5 / 100.0f, g_usage.d7 / 100.0f);
+  g_web->send(200, "application/json", b);
+}
+static void handleTokensPost() {
+  String body = g_web->arg("plain");
+  g_tok.tin      = jll(body, "in");
+  g_tok.tout     = jll(body, "out");
+  g_tok.cache    = jll(body, "cache");
+  g_tok.sessions = (int)jll(body, "sessions");
+  g_tok.atMs     = millis();
+  Serial.printf("[TOK] in=%lld out=%lld cache=%lld sess=%d\n",
+                g_tok.tin, g_tok.tout, g_tok.cache, g_tok.sessions);
+  g_web->send(200, "application/json", "{\"ok\":true}");
+  update_tok_row();
+}
+static void handleInfo() {
+  String h = F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
+               "<meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<title>Claude Usage Stick</title><style>" WEB_CSS "</style></head><body><div class=card>"
+               "<h1>" WEB_SPARK " Claude Usage Stick</h1>"
+               "<p>Device online. Endpoints: <code>GET /window</code> (janela atual) e "
+               "<code>POST /tokens</code> (bridge de tokens por sessao — ver tools/token_bridge.py).</p>"
+               "</div></body></html>");
+  g_web->send(200, "text/html; charset=utf-8", h);
+}
+static void start_data_web() {
+  stop_web();
+  ensure_mdns();
+  g_web = new WebServer(80);
+  g_web->on("/", HTTP_GET, handleInfo);
+  g_web->on("/window", HTTP_GET, handleWindow);
+  g_web->on("/tokens", HTTP_POST, handleTokensPost);
+  g_web->onNotFound([]() { g_web->send(404, "application/json", "{\"error\":\"not_found\"}"); });
+  g_web->begin();
 }
 
 static void ui_token() {
@@ -610,22 +744,25 @@ static void ui_token() {
   lv_obj_t *scr = lv_screen_active();
 
   if (!g_onboarding && g_hasToken) {
-    lv_obj_t *bk = mkbtn(scr, LV_SYMBOL_LEFT " Voltar", &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
+    lv_obj_t *bk = mkbtn(scr, TRS(LV_SYMBOL_LEFT " Voltar", LV_SYMBOL_LEFT " Back"),
+                         &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
     lv_obj_align(bk, LV_ALIGN_TOP_RIGHT, -12, 8);
     lv_obj_add_event_cb(bk, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(g_usage.ok ? ST_MAIN : ST_SETTINGS));
   }
 
-  lv_obj_t *mark = build_claude_mark(scr, 88);
-  lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 10);
+  lv_obj_t *mark = build_claude_mark(scr);
+  lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 8);
 
-  lv_obj_t *cap = mklabel(scr, "Cole o token pelo navegador, em:", &lv_font_montserrat_16, C_MUTED);
+  lv_obj_t *cap = mklabel(scr, TRS("Cole o token pelo navegador, em:",
+                                   "Paste the token via browser, at:"), &lv_font_montserrat_16, C_MUTED);
   lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 108);
 
   String url = String("http://") + WiFi.localIP().toString();
   lv_obj_t *ip = mklabel(scr, url.c_str(), &lv_font_montserrat_28, C_ACCENT);
   lv_obj_align(ip, LV_ALIGN_TOP_MID, 0, 132);
 
-  lv_obj_t *hint = mklabel(scr, "abra esse endereco no PC/celular na MESMA rede WiFi",
+  lv_obj_t *hint = mklabel(scr, TRS("abra esse endereco no PC/celular na MESMA rede WiFi",
+                                    "open this address on a PC/phone on the SAME WiFi"),
                            &lv_font_montserrat_12, C_MUTED);
   lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 174);
 
@@ -638,10 +775,10 @@ static void ui_token() {
   lv_obj_set_style_arc_width(sp, 5, LV_PART_MAIN);
   lv_obj_set_style_arc_width(sp, 5, LV_PART_INDICATOR);
 
-  g_tokMsg = mklabel(scr, "aguardando o token...", &lv_font_montserrat_14, C_MUTED);
+  g_tokMsg = mklabel(scr, TRS("aguardando o token...", "waiting for the token..."), &lv_font_montserrat_14, C_MUTED);
   lv_obj_align(g_tokMsg, LV_ALIGN_BOTTOM_MID, 0, -14);
 
-  // sobe o servidor web
+  // sobe o servidor web (formulario do token)
   g_web = new WebServer(80);
   g_web->on("/", HTTP_GET, handleRoot);
   g_web->on("/token", HTTP_POST, handleTokenPost);
@@ -664,9 +801,9 @@ static void ui_message(const char *title, const char *sub, uint32_t color) {
 }
 static void ui_loading(const char *sub) {
   lv_obj_t *scr = lv_screen_active();
-  lv_obj_t *mark = build_claude_mark(scr, 80);
-  lv_obj_align(mark, LV_ALIGN_CENTER, 0, -40);
-  lv_obj_t *t = mklabel(scr, "Carregando seu uso...", &lv_font_montserrat_18, C_TEXT);
+  lv_obj_t *mark = build_claude_mark(scr);
+  lv_obj_align(mark, LV_ALIGN_CENTER, 0, -50);
+  lv_obj_t *t = mklabel(scr, TRS("Carregando seu uso...", "Loading your usage..."), &lv_font_montserrat_18, C_TEXT);
   lv_obj_align(t, LV_ALIGN_CENTER, 0, 28);
   if (sub && sub[0]) {
     lv_obj_t *s = mklabel(scr, sub, &lv_font_montserrat_12, C_MUTED);
@@ -683,15 +820,8 @@ static void ui_loading(const char *sub) {
 }
 
 // ============================================================
-// Tela: dashboard (uso 5h/7d + mascotes)
+// Histórico / heatmap
 // ============================================================
-// ---- Helpers: card, chip, mascote, histórico ----
-static uint32_t status_color(const char *s) {
-  if (!s || !s[0]) return C_MUTED;
-  if (!strcmp(s, "rejected") || !strcmp(s, "rate_limited") || !strcmp(s, "exceeded")) return C_BAD;
-  if (strstr(s, "warning")) return C_WARN;
-  return C_OK;
-}
 static void hist_push(float h5, float d7) {
   time_t now = time(nullptr);
   g_hist[g_histHead].t  = (now > 1000000000L) ? (uint32_t)now : 0;
@@ -702,58 +832,124 @@ static void hist_push(float h5, float d7) {
 }
 static int hist_idx(int i) { return (g_histHead - g_histN + i + HIST_MAX * 2) % HIST_MAX; }
 
+// dia local (dias desde epoch, corrigido pelo fuso configurado)
+static uint32_t day_key() {
+  time_t now = time(nullptr);
+  if (now < 1000000000L) return 0;
+  return (uint32_t)((now + (long)g_tzOffset * 3600) / 86400);
+}
+// retorna o índice do dia em g_days (cria/rotaciona se preciso) — retorna int
+// em vez de DayHeat* para não tropeçar nos protótipos automáticos do .ino
+static int day_slot(uint32_t dk) {
+  for (int i = 0; i < g_dayN; i++)
+    if (g_days[i].day == dk) return i;
+  if (g_dayN == NDAYS) {              // descarta o mais antigo (array cronológico)
+    memmove(&g_days[0], &g_days[1], sizeof(DayHeat) * (NDAYS - 1));
+    g_dayN--;
+  }
+  int i = g_dayN++;
+  g_days[i].day = dk;
+  memset(g_days[i].burn, 0, sizeof(g_days[i].burn));
+  return i;
+}
+
 // Heatmap: atribui o consumo (Δ utilização 5h) à hora do dia local.
 static void accumulate_heat(float h5) {
   time_t now = time(nullptr);
   if (g_lastH5 >= 0 && now > 1000000000L) {
     float d = h5 - g_lastH5;
-    if (d > 0 && d < 100) { struct tm tmv; localtime_r(&now, &tmv); g_hourBurn[tmv.tm_hour] += d; }
+    if (d > 0 && d < 100) {
+      struct tm tmv; localtime_r(&now, &tmv);
+      g_hourBurn[tmv.tm_hour] += d;
+      uint32_t dk = day_key();
+      if (dk) g_days[day_slot(dk)].burn[tmv.tm_hour] += d;
+    }
   }
   g_lastH5 = h5;
 }
 
+// soma o heatmap conforme o período escolhido (0=hoje 1=7d 2=30d 3=tudo)
+static void heat_mode_data(int mode, float out[24]) {
+  memset(out, 0, sizeof(float) * 24);
+  if (mode == 3) { memcpy(out, g_hourBurn, sizeof(float) * 24); return; }
+  uint32_t today = day_key();
+  if (!today) return;
+  uint32_t minDay = (mode == 0) ? today : (mode == 1) ? today - 6 : today - 29;
+  for (int i = 0; i < g_dayN; i++) {
+    if (g_days[i].day < minDay || g_days[i].day > today) continue;
+    for (int h = 0; h < 24; h++) out[h] += g_days[i].burn[h];
+  }
+}
+
 // Persistência do histórico/heatmap em LittleFS (sobrevive reboot).
-struct HistFile { uint32_t magic; int n, head; Sample hist[HIST_MAX]; float hourBurn[24]; float lastH5; };
+// v2 = v1 + heatmap por dia. Carrega v1 antigo para não perder histórico.
+#define HIST_MAGIC_V1 0xC1A0DE01
+#define HIST_MAGIC_V2 0xC1A0DE02
+#define HIST_MAX_V1 120
+struct HistFileV1 { uint32_t magic; int n, head; Sample hist[HIST_MAX_V1]; float hourBurn[24]; float lastH5; };
+struct HistFileV2 {
+  uint32_t magic; int n, head; Sample hist[HIST_MAX]; float hourBurn[24]; float lastH5;
+  int dayN; DayHeat days[NDAYS];
+};
 static void save_history() {
   File f = LittleFS.open("/hist.bin", "w");
   if (!f) return;
-  HistFile hf;
-  hf.magic = 0xC1A0DE01; hf.n = g_histN; hf.head = g_histHead;
+  static HistFileV2 hf;                       // grande demais p/ stack
+  hf.magic = HIST_MAGIC_V2; hf.n = g_histN; hf.head = g_histHead;
   memcpy(hf.hist, g_hist, sizeof(g_hist));
   memcpy(hf.hourBurn, g_hourBurn, sizeof(g_hourBurn));
   hf.lastH5 = g_lastH5;
+  hf.dayN = g_dayN;
+  memcpy(hf.days, g_days, sizeof(g_days));
   f.write((uint8_t *)&hf, sizeof(hf));
   f.close();
 }
 static void load_history() {
   File f = LittleFS.open("/hist.bin", "r");
   if (!f) return;
-  HistFile hf;
-  if (f.read((uint8_t *)&hf, sizeof(hf)) == (int)sizeof(hf) && hf.magic == 0xC1A0DE01) {
-    g_histN = hf.n; g_histHead = hf.head;
-    memcpy(g_hist, hf.hist, sizeof(g_hist));
-    memcpy(g_hourBurn, hf.hourBurn, sizeof(g_hourBurn));
-    g_lastH5 = hf.lastH5;
+  uint32_t magic = 0;
+  f.read((uint8_t *)&magic, sizeof(magic));
+  f.seek(0);
+  if (magic == HIST_MAGIC_V2) {
+    static HistFileV2 hf;
+    if (f.read((uint8_t *)&hf, sizeof(hf)) == (int)sizeof(hf)) {
+      g_histN = hf.n; g_histHead = hf.head;
+      memcpy(g_hist, hf.hist, sizeof(g_hist));
+      memcpy(g_hourBurn, hf.hourBurn, sizeof(g_hourBurn));
+      g_lastH5 = hf.lastH5;
+      g_dayN = (hf.dayN >= 0 && hf.dayN <= NDAYS) ? hf.dayN : 0;
+      memcpy(g_days, hf.days, sizeof(g_days));
+    }
+  } else if (magic == HIST_MAGIC_V1) {
+    static HistFileV1 hf;
+    if (f.read((uint8_t *)&hf, sizeof(hf)) == (int)sizeof(hf)) {
+      int n = (hf.n > HIST_MAX_V1) ? HIST_MAX_V1 : hf.n;
+      for (int i = 0; i < n; i++)
+        g_hist[i] = hf.hist[(hf.head - n + i + HIST_MAX_V1 * 2) % HIST_MAX_V1];
+      g_histN = n; g_histHead = n % HIST_MAX;
+      memcpy(g_hourBurn, hf.hourBurn, sizeof(g_hourBurn));
+      g_lastH5 = hf.lastH5;
+      Serial.println("[HIST] migrado v1 -> v2");
+    }
   }
   f.close();
 }
 
-static void burn_text(char *out, size_t sz) {
-  if (g_histN < 2) { strlcpy(out, "Coletando dados de uso... (~alguns minutos)", sz); return; }
-  Sample a = g_hist[hist_idx(0)], b = g_hist[hist_idx(g_histN - 1)];
-  if (a.t == 0 || b.t == 0 || b.t <= a.t) { strlcpy(out, "Coletando dados de uso...", sz); return; }
-  float dt = (b.t - a.t) / 60.0f;                 // minutos
-  if (dt < 0.5f) { strlcpy(out, "Coletando dados de uso...", sz); return; }
-  float rate = (b.h5 - a.h5) / dt;                // %/min na janela 5h
-  if (rate <= 0.02f) { strlcpy(out, "Uso estavel no momento.", sz); return; }
-  float mins = (100.0f - b.h5) / rate;
-  snprintf(out, sz, "No ritmo atual, a janela 5h enche em ~%dh%02dm.", (int)mins / 60, (int)mins % 60);
+// ============================================================
+// Dashboard — helpers visuais
+// ============================================================
+static uint32_t status_color(const char *s) {
+  if (!s || !s[0]) return C_MUTED;
+  if (!strcmp(s, "rejected") || !strcmp(s, "rate_limited") || !strcmp(s, "exceeded")) return C_BAD;
+  if (strstr(s, "warning")) return C_WARN;
+  return C_OK;
 }
-static void fmt_clock(uint32_t epoch, char *out, int sz) {
-  if (epoch == 0 || time(nullptr) < 1000000000L) { strlcpy(out, "--:--", sz); return; }
-  time_t t = (time_t)epoch; struct tm tmv;
-  localtime_r(&t, &tmv);
-  strftime(out, sz, "%a %H:%M", &tmv);
+static const char *overall_label(const char *s) {
+  if (!s || !s[0]) return "--";
+  if (!strcmp(s, "allowed")) return "OK";
+  if (strstr(s, "warning"))  return TRS("ATENCAO", "WARNING");
+  if (!strcmp(s, "rejected")) return TRS("BLOQUEADO", "BLOCKED");
+  return s;
 }
 
 // label posicionado vazio (preenchido em refresh_ui_values/dash_tick)
@@ -776,38 +972,38 @@ static void tile_setup(lv_obj_t *t) {
   lv_obj_set_style_pad_all(t, 0, 0);
   lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
 }
-// card moderno (superfície arredondada)
+// card moderno: superfície arredondada SEM borda (estrutura por cor, não caixa)
 static lv_obj_t *card(lv_obj_t *p, int x, int y, int w, int h) {
   lv_obj_t *c = lv_obj_create(p);
   lv_obj_set_pos(c, x, y); lv_obj_set_size(c, w, h);
   lv_obj_set_style_bg_color(c, lv_color_hex(C_SURFACE), 0);
-  lv_obj_set_style_border_color(c, lv_color_hex(C_BORDER), 0);
-  lv_obj_set_style_border_width(c, 1, 0);
-  lv_obj_set_style_radius(c, 16, 0);
-  lv_obj_set_style_pad_all(c, 12, 0);
+  lv_obj_set_style_border_width(c, 0, 0);
+  lv_obj_set_style_radius(c, 18, 0);
+  lv_obj_set_style_pad_all(c, 14, 0);
   lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
   return c;
 }
-// pílula de status (chip)
+// chip com fundo tintado + texto na cor (mais leve que chip sólido)
 static lv_obj_t *mkchip(lv_obj_t *p, int x, int y) {
   lv_obj_t *o = lv_obj_create(p);
   lv_obj_set_pos(o, x, y);
-  lv_obj_set_size(o, LV_SIZE_CONTENT, 26);
-  lv_obj_set_style_radius(o, 13, 0);
-  lv_obj_set_style_pad_hor(o, 12, 0);
+  lv_obj_set_size(o, LV_SIZE_CONTENT, 24);
+  lv_obj_set_style_radius(o, 12, 0);
+  lv_obj_set_style_pad_hor(o, 10, 0);
   lv_obj_set_style_pad_ver(o, 0, 0);
   lv_obj_set_style_border_width(o, 0, 0);
   lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t *l = lv_label_create(o);
-  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
   lv_label_set_text(l, ""); lv_obj_center(l);
   return o;
 }
 static void set_chip(lv_obj_t *o, const char *txt, uint32_t col) {
   if (!o) return;
-  lv_obj_set_style_bg_color(o, lv_color_hex(col), 0);
+  lv_color_t c = lv_color_hex(col);
+  lv_obj_set_style_bg_color(o, lv_color_mix(c, lv_color_hex(C_BG), 60), 0);
   lv_obj_t *l = lv_obj_get_child(o, 0);
-  if (l) { lv_label_set_text(l, txt[0] ? txt : "--"); lv_obj_set_style_text_color(l, lv_color_hex(C_BG), 0); }
+  if (l) { lv_label_set_text(l, txt[0] ? txt : "--"); lv_obj_set_style_text_color(l, c, 0); }
 }
 // peça retangular arredondada do mascote
 static lv_obj_t *rrect(lv_obj_t *p, int x, int y, int w, int h, int r, uint32_t col) {
@@ -820,113 +1016,252 @@ static lv_obj_t *rrect(lv_obj_t *p, int x, int y, int w, int h, int r, uint32_t 
   lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
   return o;
 }
-// Mascote Clawd: corpo arredondado + olhos + braços/pernas retangulares.
-// Online = coral; offline = cinza/translúcido + olhos fechados. Anima no loop (bob + pisca).
-static void build_mascot(lv_obj_t *parent, int cx, int cy, bool big, const char *name, bool up) {
-  if (g_mascN >= 8) return;
-  float s = big ? 1.0f : 0.74f;
-  #define SC(v) ((int)((v) * s))
-  int CW = SC(64), CH = SC(74);
-  lv_obj_t *c = lv_obj_create(parent);
-  lv_obj_set_pos(c, cx, cy); lv_obj_set_size(c, CW, CH);
-  lv_obj_set_style_bg_opa(c, 0, 0); lv_obj_set_style_border_width(c, 0, 0);
-  lv_obj_set_style_pad_all(c, 0, 0); lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-  if (!up) lv_obj_set_style_opa(c, 150, 0);
-  uint32_t body = up ? C_ACCENT : C_BORDER, dark = up ? 0x141414 : C_MUTED;
-  rrect(c, SC(1),  SC(28), SC(9),  SC(20), SC(4),  body);   // braço esq
-  rrect(c, SC(54), SC(28), SC(9),  SC(20), SC(4),  body);   // braço dir
-  rrect(c, SC(18), SC(50), SC(9),  SC(22), SC(4),  body);   // perna esq
-  rrect(c, SC(37), SC(50), SC(9),  SC(22), SC(4),  body);   // perna dir
-  rrect(c, SC(8),  SC(6),  SC(48), SC(46), SC(15), body);   // corpo/cabeça
-  g_masc[g_mascN].eye[0] = rrect(c, SC(22), SC(22), SC(6), up ? SC(9) : SC(3), SC(3), dark);
-  g_masc[g_mascN].eye[1] = rrect(c, SC(36), SC(22), SC(6), up ? SC(9) : SC(3), SC(3), dark);
-  rrect(c, SC(26), SC(38), SC(12), SC(3), SC(2), dark);     // boca
-  lv_obj_t *l = mklabel(parent, name, big ? &lv_font_montserrat_16 : &lv_font_montserrat_14, up ? C_TEXT : C_MUTED);
-  lv_obj_set_width(l, CW + 24);
-  lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_pos(l, cx + CW / 2 - (CW + 24) / 2, cy + CH + 2);
-  g_masc[g_mascN].cont = c; g_masc[g_mascN].baseY = cy; g_masc[g_mascN].up = up;
-  g_masc[g_mascN].eyeH = up ? SC(9) : SC(3);
-  g_mascN++;
-  #undef SC
+// humor do modelo: sonda real (HTTP) + incidentes do status.claude.com
+static int model_mood(int i) {
+  bool inc = (i == 0) ? g_status.haikuUp : (i == 1) ? g_status.sonnetUp
+           : (i == 2) ? g_status.opusUp  : g_status.fableUp;
+  int c = g_models[i].pr.code;
+  if (!inc) return 3;
+  if (c == 0) return 0;
+  if (c == 200) return 1;
+  if (c == 429) return 2;
+  if (c == 404) return 4;
+  return 3;                              // rede / 5xx / auth
 }
 
-// ---- Builders de cada tile (cards; valores via refresh_ui_values) ----
-static void mkbar(lv_obj_t *parent, lv_obj_t **slot, int y) {
-  lv_obj_t *bar = lv_bar_create(parent);
-  lv_obj_set_pos(bar, 0, y); lv_obj_set_size(bar, 196, 10);
-  lv_bar_set_range(bar, 0, 100);
-  lv_obj_set_style_bg_color(bar, lv_color_hex(C_SURFACE2), LV_PART_MAIN);
-  lv_obj_set_style_radius(bar, 5, LV_PART_MAIN);
-  lv_obj_set_style_radius(bar, 5, LV_PART_INDICATOR);
-  *slot = bar;
+// adereço pixel que identifica cada modelo (flutuando sobre a cabeça)
+static void build_accessory(lv_obj_t *c, int model) {
+  switch (model) {
+    case 0:                              // Haiku: raio
+      rrect(c, 46, 0, 8, 7, 1, C_WARN);
+      rrect(c, 41, 5, 8, 7, 1, C_WARN);
+      rrect(c, 46, 10, 8, 7, 1, C_WARN);
+      break;
+    case 1:                              // Sonnet: nota musical
+      rrect(c, 50, 0, 10, 4, 1, 0x7DD3FC);
+      rrect(c, 50, 0, 4, 13, 1, 0x7DD3FC);
+      rrect(c, 44, 10, 8, 7, 3, 0x7DD3FC);
+      break;
+    case 2:                              // Opus: coroa
+      rrect(c, 30, 4, 7, 8, 1, C_WARN);
+      rrect(c, 41, 1, 7, 11, 1, C_WARN);
+      rrect(c, 52, 4, 7, 8, 1, C_WARN);
+      rrect(c, 30, 12, 29, 6, 1, C_WARN);
+      break;
+    case 3:                              // Fable: faisca (estrela 4 pontas)
+      rrect(c, 41, 0, 6, 17, 2, 0xC4B5FD);
+      rrect(c, 36, 6, 16, 6, 2, 0xC4B5FD);
+      break;
+  }
 }
-static void build_tile_overview(lv_obj_t *t) {
-  g_ui.ovChip = mkchip(t, 12, 2);
-  lv_obj_t *c5 = card(t, 8, 34, 224, 104);
-  tstatic(c5, "5 horas", &lv_font_montserrat_14, C_MUTED, 0, 0);
-  g_ui.ovPct5 = tlabel(c5, &lv_font_montserrat_28, C_OK, 0, 14);
-  mkbar(c5, &g_ui.ovBar5, 50);
-  g_ui.ovEta5 = tlabel(c5, &lv_font_montserrat_12, C_MUTED, 0, 66);
-  lv_obj_t *c7 = card(t, 248, 34, 224, 104);
-  tstatic(c7, "7 dias", &lv_font_montserrat_14, C_MUTED, 0, 0);
-  g_ui.ovPct7 = tlabel(c7, &lv_font_montserrat_28, C_OK, 0, 14);
-  mkbar(c7, &g_ui.ovBar7, 50);
-  g_ui.ovEta7 = tlabel(c7, &lv_font_montserrat_12, C_MUTED, 0, 66);
-  build_mascot(t, 28,  150, false, "Haiku",  g_status.haikuUp);
-  build_mascot(t, 142, 150, false, "Sonnet", g_status.sonnetUp);
-  build_mascot(t, 256, 150, false, "Opus",   g_status.opusUp);
-  build_mascot(t, 370, 150, false, "Fable",  g_status.fableUp);
+
+// Mascote da pagina de modelos: Clawd oficial + humor + adereço.
+static void build_model_mascot(lv_obj_t *parent, int cx, int i) {
+  if (g_mascN >= NMODELS) return;
+  int mood = model_mood(i);
+  int baseY = 14;
+  lv_obj_t *c = lv_obj_create(parent);
+  lv_obj_set_pos(c, cx - 44, baseY); lv_obj_set_size(c, 88, 80);
+  lv_obj_set_style_bg_opa(c, 0, 0); lv_obj_set_style_border_width(c, 0, 0);
+  lv_obj_set_style_pad_all(c, 0, 0); lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *img = lv_image_create(c);
+  lv_image_set_src(img, &img_clawd_md);
+  lv_obj_set_pos(img, 0, 20);
+
+  build_accessory(c, i);
+
+  const int ex[2] = {CLAWD_MD_EYE0_X, CLAWD_MD_EYE1_X};
+  const int ey = CLAWD_MD_EYE0_Y + 20, ew = CLAWD_MD_EYE0_W, eh = CLAWD_MD_EYE0_H;
+
+  Mascot &m = g_masc[g_mascN];
+  m.cont = c; m.img = img; m.baseY = baseY; m.mood = mood;
+  m.lid[0] = m.lid[1] = nullptr; m.drop = nullptr;
+
+  if (mood == 1) {                       // ok: pálpebras escondidas p/ piscar
+    for (int k = 0; k < 2; k++) {
+      m.lid[k] = rrect(c, ex[k] - 1, ey - 1, ew + 2, eh + 2, 1, C_ACCENT);
+      lv_obj_add_flag(m.lid[k], LV_OBJ_FLAG_HIDDEN);
+    }
+  } else if (mood == 2) {                // limitado: gota de suor
+    m.drop = rrect(c, 70, 24, 6, 10, 3, 0x7DD3FC);
+  } else if (mood == 3) {                // erro/incidente: cinza + olhos em X
+    lv_obj_set_style_image_recolor(img, lv_color_hex(0x6A6A74), 0);
+    lv_obj_set_style_image_recolor_opa(img, 190, 0);
+    lv_obj_set_y(img, 24);               // caidinho
+    for (int k = 0; k < 2; k++) {
+      g_mXPts[i][k * 2][0]     = { (lv_value_precise_t)(ex[k] - 2), (lv_value_precise_t)(ey + 2) };
+      g_mXPts[i][k * 2][1]     = { (lv_value_precise_t)(ex[k] + ew + 2), (lv_value_precise_t)(ey + eh + 6) };
+      g_mXPts[i][k * 2 + 1][0] = { (lv_value_precise_t)(ex[k] + ew + 2), (lv_value_precise_t)(ey + 2) };
+      g_mXPts[i][k * 2 + 1][1] = { (lv_value_precise_t)(ex[k] - 2), (lv_value_precise_t)(ey + eh + 6) };
+      for (int l = 0; l < 2; l++) {
+        lv_obj_t *ln = lv_line_create(c);
+        lv_line_set_points(ln, g_mXPts[i][k * 2 + l], 2);
+        lv_obj_set_style_line_width(ln, 3, 0);
+        lv_obj_set_style_line_color(ln, lv_color_hex(C_BAD), 0);
+        lv_obj_set_style_line_rounded(ln, true, 0);
+      }
+    }
+  } else if (mood == 4) {                // n/d p/ o plano: dormindo
+    lv_obj_set_style_image_recolor(img, lv_color_hex(0x6A6A74), 0);
+    lv_obj_set_style_image_recolor_opa(img, 170, 0);
+    for (int k = 0; k < 2; k++)
+      m.lid[k] = rrect(c, ex[k] - 1, ey + eh / 2, ew + 2, eh / 2 + 1, 1, 0x8A8A94);
+    lv_obj_set_style_opa(c, 180, 0);
+  } else {                               // nunca sondado: apagadinho
+    lv_obj_set_style_opa(c, 140, 0);
+  }
+  g_mascN++;
 }
-static void build_tile_reset(lv_obj_t *t) {
-  lv_obj_t *c5 = card(t, 8, 6, 464, 104);
-  tstatic(c5, "Janela de 5 horas", &lv_font_montserrat_14, C_MUTED, 0, 0);
-  g_ui.rcBig5 = tlabel(c5, &lv_font_montserrat_28, C_TEXT, 0, 18);
-  g_ui.rcAt5  = tlabel(c5, &lv_font_montserrat_14, C_MUTED, 0, 56);
-  g_ui.rcChip5 = mkchip(c5, 330, 4);
-  lv_obj_t *c7 = card(t, 8, 120, 464, 104);
-  tstatic(c7, "Janela de 7 dias", &lv_font_montserrat_14, C_MUTED, 0, 0);
-  g_ui.rcBig7 = tlabel(c7, &lv_font_montserrat_28, C_TEXT, 0, 18);
-  g_ui.rcAt7  = tlabel(c7, &lv_font_montserrat_14, C_MUTED, 0, 56);
-  g_ui.rcChip7 = mkchip(c7, 330, 4);
+
+static void model_chip(int i, char *out, size_t sz, uint32_t *col) {
+  int c = g_models[i].pr.code;
+  if (c == 0)             { strlcpy(out, "--", sz);        *col = C_MUTED; }
+  else if (c == 200)      { snprintf(out, sz, "OK %.1fs", g_models[i].pr.ms / 1000.0f); *col = C_OK; }
+  else if (c == 429)      { strlcpy(out, TRS("LIMITADO", "LIMITED"), sz); *col = C_WARN; }
+  else if (c == 404)      { strlcpy(out, TRS("N/D", "N/A"), sz); *col = C_MUTED; }
+  else if (c == 401 || c == 403) { strlcpy(out, "AUTH", sz); *col = C_BAD; }
+  else if (c < 0)         { strlcpy(out, TRS("REDE", "NET"), sz); *col = C_BAD; }
+  else                    { snprintf(out, sz, TRS("ERRO %d", "ERR %d"), c); *col = C_BAD; }
 }
+
+// ============================================================
+// Builders dos 4 tiles
+// ============================================================
+// Tile 0 — AGORA: janelas 5h/semana com % grande, medidor segmentado
+// (verde -> vermelho conforme o uso) e countdown grande.
+static void build_win_card(lv_obj_t *t, int x, const char *title,
+                           lv_obj_t **pct, lv_obj_t **seg, lv_obj_t **at, lv_obj_t **cd) {
+  lv_obj_t *c = card(t, x, 4, 228, 210);
+  tstatic(c, title, &lv_font_montserrat_14, C_MUTED, 0, 0);
+  *pct = tlabel(c, &lv_font_montserrat_48, C_OK, 0, 20);
+  for (int i = 0; i < NSEG; i++)                    // medidor: 18 segmentos
+    seg[i] = rrect(c, i * 11, 82, 8, 16, 2, C_TRACK);
+  *at = tlabel(c, &lv_font_montserrat_12, C_FAINT, 0, 106);
+  *cd = tlabel(c, &lv_font_montserrat_40, C_TEXT, 0, 124);
+}
+static void build_tile_agora(lv_obj_t *t) {
+  build_win_card(t, 8,   TRS("5 HORAS", "5 HOURS"), &g_ui.agPct5, g_ui.seg5, &g_ui.agAt5, &g_ui.agCd5);
+  build_win_card(t, 244, TRS("SEMANA", "WEEK"),     &g_ui.agPct7, g_ui.seg7, &g_ui.agAt7, &g_ui.agCd7);
+  g_ui.agChip = mkchip(t, 8, 220);
+  g_ui.agTok = tlabel(t, &lv_font_montserrat_12, C_MUTED, 130, 226);
+  lv_obj_set_width(g_ui.agTok, 342);
+  lv_obj_set_style_text_align(g_ui.agTok, LV_TEXT_ALIGN_RIGHT, 0);
+}
+// Tile 1 — MODELOS: Clawd oficial por modelo (humor animado) + sonda + incidentes.
 static void build_tile_models(lv_obj_t *t) {
-  tstatic(t, "Status dos modelos", &lv_font_montserrat_16, C_TEXT, 14, 4);
-  build_mascot(t, 28,  34, true, "Haiku",  g_status.haikuUp);
-  build_mascot(t, 142, 34, true, "Sonnet", g_status.sonnetUp);
-  build_mascot(t, 256, 34, true, "Opus",   g_status.opusUp);
-  build_mascot(t, 370, 34, true, "Fable",  g_status.fableUp);
-  g_ui.incident = tlabel(t, &lv_font_montserrat_14, C_MUTED, 14, 200);
+  static const int CENTERS[NMODELS] = {60, 180, 300, 420};
+  for (int i = 0; i < NMODELS; i++) {
+    build_model_mascot(t, CENTERS[i], i);
+    lv_obj_t *n = mklabel(t, g_models[i].name, &lv_font_montserrat_16,
+                          model_mood(i) == 1 ? C_TEXT : C_MUTED);
+    lv_obj_set_width(n, 104);
+    lv_obj_set_style_text_align(n, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(n, CENTERS[i] - 52, 98);
+    g_ui.mChip[i] = mkchip(t, 0, 122);
+  }
+  tstatic(t, TRS("sonda real na API \xE2\x80\xA2 1 modelo por ciclo",
+                 "live API probe \xE2\x80\xA2 1 model per cycle"),
+          &lv_font_montserrat_12, C_FAINT, 14, 170);
+  g_ui.incident = tlabel(t, &lv_font_montserrat_14, C_MUTED, 14, 194);
   lv_obj_set_width(g_ui.incident, 452);
   lv_label_set_long_mode(g_ui.incident, LV_LABEL_LONG_WRAP);
 }
+// Tile 2 — JANELA 5H: histórico + projeção pontilhada até esgotar.
+#define TR_X0 12
+#define TR_Y0 10
+#define TR_W  440
+#define TR_H  126
+static int tr_x(uint32_t tt, uint32_t ws, uint32_t we) {
+  if (we <= ws) return TR_X0;
+  long long v = (long long)(tt - ws) * TR_W / (long long)(we - ws);
+  if (v < 0) v = 0; if (v > TR_W) v = TR_W;
+  return TR_X0 + (int)v;
+}
+static int tr_y(float p) {
+  if (p < 0) p = 0; if (p > 100) p = 100;
+  return TR_Y0 + TR_H - (int)(p * TR_H / 100.0f);
+}
 static void build_tile_trend(lv_obj_t *t) {
-  tstatic(t, "Tendencia de uso", &lv_font_montserrat_16, C_TEXT, 14, 4);
-  g_ui.chart = lv_chart_create(t);
-  lv_obj_set_pos(g_ui.chart, 14, 30); lv_obj_set_size(g_ui.chart, 452, 150);
-  lv_chart_set_type(g_ui.chart, LV_CHART_TYPE_LINE);
-  lv_chart_set_range(g_ui.chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
-  lv_chart_set_point_count(g_ui.chart, 40);
-  lv_chart_set_div_line_count(g_ui.chart, 3, 0);
-  lv_obj_set_style_bg_color(g_ui.chart, lv_color_hex(C_SURFACE), 0);
-  lv_obj_set_style_border_color(g_ui.chart, lv_color_hex(C_BORDER), 0);
-  lv_obj_set_style_border_width(g_ui.chart, 1, 0);
-  lv_obj_set_style_radius(g_ui.chart, 12, 0);
-  lv_obj_set_style_line_color(g_ui.chart, lv_color_hex(C_BORDER), LV_PART_MAIN);
-  lv_obj_set_style_width(g_ui.chart, 0, LV_PART_INDICATOR);   // sem pontos
-  lv_obj_set_style_height(g_ui.chart, 0, LV_PART_INDICATOR);
-  lv_obj_set_style_line_width(g_ui.chart, 3, LV_PART_ITEMS);
-  g_ui.ser5 = lv_chart_add_series(g_ui.chart, lv_color_hex(C_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
-  g_ui.ser7 = lv_chart_add_series(g_ui.chart, lv_color_hex(C_OK), LV_CHART_AXIS_PRIMARY_Y);
-  tstatic(t, "5h", &lv_font_montserrat_14, C_ACCENT, 14, 186);
-  tstatic(t, "7d", &lv_font_montserrat_14, C_OK, 56, 186);
-  g_ui.burn = tlabel(t, &lv_font_montserrat_14, C_WARN, 14, 212);
-  lv_obj_set_width(g_ui.burn, 452);
-  lv_label_set_long_mode(g_ui.burn, LV_LABEL_LONG_WRAP);
+  tstatic(t, TRS("Janela de 5h", "5-hour window"), &lv_font_montserrat_16, C_TEXT, 14, 2);
+  tstatic(t, TRS("uso real + projecao", "real usage + projection"), &lv_font_montserrat_12, C_FAINT, 320, 6);
+
+  lv_obj_t *c = card(t, 8, 26, 464, 170);
+  lv_obj_set_style_pad_all(c, 0, 0);
+
+  // grade: 25/50/75%
+  for (int i = 1; i <= 3; i++) {
+    lv_obj_t *g = rrect(c, TR_X0, tr_y(i * 25.0f), TR_W, 1, 0, C_GRID);
+    (void)g;
+  }
+  tstatic(c, "100", &lv_font_montserrat_12, C_FAINT, TR_X0 + TR_W - 24, TR_Y0 - 6);
+  tstatic(c, "0",   &lv_font_montserrat_12, C_FAINT, TR_X0 + TR_W - 10, TR_Y0 + TR_H - 14);
+
+  // histórico (linha sólida coral)
+  g_ui.trHist = lv_line_create(c);
+  lv_obj_set_pos(g_ui.trHist, 0, 0);
+  lv_obj_set_style_line_width(g_ui.trHist, 3, 0);
+  lv_obj_set_style_line_color(g_ui.trHist, lv_color_hex(C_ACCENT), 0);
+  lv_obj_set_style_line_rounded(g_ui.trHist, true, 0);
+
+  // projeção (pontilhada)
+  g_ui.trProj = lv_line_create(c);
+  lv_obj_set_pos(g_ui.trProj, 0, 0);
+  lv_obj_set_style_line_width(g_ui.trProj, 2, 0);
+  lv_obj_set_style_line_color(g_ui.trProj, lv_color_hex(C_ACCENT), 0);
+  lv_obj_set_style_line_opa(g_ui.trProj, 170, 0);
+  lv_obj_set_style_line_dash_width(g_ui.trProj, 6, 0);
+  lv_obj_set_style_line_dash_gap(g_ui.trProj, 6, 0);
+
+  // marcador do ponto atual
+  g_ui.trDot = rrect(c, 0, 0, 8, 8, 4, C_TEXT);
+  lv_obj_add_flag(g_ui.trDot, LV_OBJ_FLAG_HIDDEN);
+
+  // horários do eixo X (início da janela / reset)
+  g_ui.trT0 = tlabel(c, &lv_font_montserrat_12, C_FAINT, TR_X0, TR_Y0 + TR_H + 8);
+  g_ui.trT1 = tlabel(c, &lv_font_montserrat_12, C_FAINT, TR_X0 + TR_W - 40, TR_Y0 + TR_H + 8);
+
+  g_ui.trCap = tlabel(t, &lv_font_montserrat_16, C_MUTED, 14, 210);
+  lv_obj_set_width(g_ui.trCap, 452);
+  lv_label_set_long_mode(g_ui.trCap, LV_LABEL_LONG_WRAP);
+}
+// Tile 3 — RITMO: heatmap por hora com filtro de período.
+static void heat_btn_style() {
+  const char *names[4] = {TRS("Hoje", "Today"), "7d", "30d", TRS("Tudo", "All")};
+  for (int i = 0; i < 4; i++) {
+    if (!g_ui.heatBtn[i]) continue;
+    bool on = (i == g_heatMode);
+    lv_obj_set_style_bg_color(g_ui.heatBtn[i], lv_color_hex(on ? C_ACCENT : C_SURFACE2), 0);
+    lv_obj_t *l = lv_obj_get_child(g_ui.heatBtn[i], 0);
+    if (l) {
+      lv_label_set_text(l, names[i]);
+      lv_obj_set_style_text_color(l, lv_color_hex(on ? C_BG : C_MUTED), 0);
+    }
+  }
+}
+static void heat_btn_cb(lv_event_t *e) {
+  int m = (int)(intptr_t)lv_event_get_user_data(e);
+  if (m == g_heatMode) return;
+  g_heatMode = m;
+  g_prefs.putInt("heatm", m);
+  heat_btn_style();
+  heat_redraw();
 }
 static void build_tile_heat(lv_obj_t *t) {
-  tstatic(t, "Uso por hora do dia", &lv_font_montserrat_16, C_TEXT, 14, 4);
-  tstatic(t, "quanto voce queima de quota em cada hora", &lv_font_montserrat_12, C_MUTED, 14, 26);
+  tstatic(t, TRS("Ritmo por hora", "Hourly rhythm"), &lv_font_montserrat_16, C_TEXT, 14, 6);
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t *b = lv_button_create(t);
+    lv_obj_set_size(b, 52, 30);
+    lv_obj_set_pos(b, 246 + i * 56, 0);
+    lv_obj_set_style_radius(b, 15, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_ext_click_area(b, 6);
+    lv_obj_t *l = mklabel(b, "", &lv_font_montserrat_14, C_MUTED);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, heat_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    g_ui.heatBtn[i] = b;
+  }
+  heat_btn_style();
   for (int h = 0; h < 24; h++) {
     lv_obj_t *bar = lv_obj_create(t);
     lv_obj_set_size(bar, 13, 4);
@@ -943,15 +1278,8 @@ static void build_tile_heat(lv_obj_t *t) {
     lv_obj_t *l = mklabel(t, s, &lv_font_montserrat_12, C_MUTED);
     lv_obj_set_pos(l, 14 + h * 18, 186);
   }
-}
-// Detalhes minimalista: só "quem te limita primeiro" + estado de overage.
-static void build_tile_details(lv_obj_t *t) {
-  lv_obj_t *cap = mklabel(t, "Limite que vai te bloquear primeiro", &lv_font_montserrat_14, C_MUTED);
-  lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 46);
-  g_ui.dvClaim = mklabel(t, "", &lv_font_montserrat_40, C_ACCENT);
-  lv_obj_align(g_ui.dvClaim, LV_ALIGN_TOP_MID, 0, 84);
-  g_ui.dvOverage = mklabel(t, "", &lv_font_montserrat_14, C_MUTED);
-  lv_obj_align(g_ui.dvOverage, LV_ALIGN_TOP_MID, 0, 156);
+  tstatic(t, TRS("quota da janela 5h queimada em cada hora local",
+                 "5h-window quota burned per local hour"), &lv_font_montserrat_12, C_FAINT, 14, 214);
 }
 
 static void on_tile_changed(lv_event_t *e) {
@@ -961,100 +1289,415 @@ static void on_tile_changed(lv_event_t *e) {
   for (int i = 0; i < NTILES; i++) {
     if (!g_ui.dots[i]) continue;
     bool on = (g_ui.tile[i] == act);
+    if (on) g_curTile = i;
     lv_obj_set_style_bg_color(g_ui.dots[i], lv_color_hex(on ? C_ACCENT : C_BORDER), 0);
     lv_obj_set_width(g_ui.dots[i], on ? 18 : 8);
   }
 }
 
-// Atualiza contadores/relógios (1s) — separado dos valores de fetch.
+// ============================================================
+// Atualização de valores
+// ============================================================
+static void update_tok_row() {
+  if (!g_ui.agTok) return;
+  if (g_tok.atMs == 0 || millis() - g_tok.atMs > TOK_FRESH_MS) {
+    lv_label_set_text(g_ui.agTok, "");
+    return;
+  }
+  char a[16], b[16], s[96];
+  fmt_tok(g_tok.tin, a, sizeof(a));
+  fmt_tok(g_tok.tout, b, sizeof(b));
+  snprintf(s, sizeof(s), TRS("tokens na janela: %s entrada \xE2\x80\xA2 %s saida",
+                             "window tokens: %s in \xE2\x80\xA2 %s out"), a, b);
+  lv_label_set_text(g_ui.agTok, s);
+}
+
+// Contadores/relógios (1s) — separado dos valores de fetch.
 static void dash_tick() {
-  if (g_state != ST_MAIN || !g_ui.ovEta5) return;
-  char e[32], b[64], c[24];
-  fmt_eta(g_usage.h5ResetEpoch, e, sizeof(e)); snprintf(b, sizeof(b), "reseta em %s", e);
-  lv_label_set_text(g_ui.ovEta5, b);
-  fmt_eta(g_usage.d7ResetEpoch, e, sizeof(e)); snprintf(b, sizeof(b), "reseta em %s", e);
-  lv_label_set_text(g_ui.ovEta7, b);
-  if (g_ui.rcBig5) { fmt_eta(g_usage.h5ResetEpoch, e, sizeof(e)); lv_label_set_text(g_ui.rcBig5, e); }
-  if (g_ui.rcBig7) { fmt_eta(g_usage.d7ResetEpoch, e, sizeof(e)); lv_label_set_text(g_ui.rcBig7, e); }
-  if (g_ui.rcAt5)  { fmt_clock(g_usage.h5ResetEpoch, c, sizeof(c)); snprintf(b, sizeof(b), "reseta %s", c); lv_label_set_text(g_ui.rcAt5, b); }
-  if (g_ui.rcAt7)  { fmt_clock(g_usage.d7ResetEpoch, c, sizeof(c)); snprintf(b, sizeof(b), "reseta %s", c); lv_label_set_text(g_ui.rcAt7, b); }
+  if (g_state != ST_MAIN || !g_ui.agCd5) return;
+  char e[32], c[24], b[64];
+  fmt_eta(g_usage.h5ResetEpoch, e, sizeof(e));
+  lv_label_set_text(g_ui.agCd5, e);
+  fmt_clock(g_usage.h5ResetEpoch, c, sizeof(c));
+  snprintf(b, sizeof(b), TRS("RESETA EM \xE2\x80\xA2 %s", "RESETS \xE2\x80\xA2 %s"), c);
+  lv_label_set_text(g_ui.agAt5, b);
+
+  fmt_eta(g_usage.d7ResetEpoch, e, sizeof(e));
+  lv_label_set_text(g_ui.agCd7, e);
+  fmt_clock(g_usage.d7ResetEpoch, c, sizeof(c));
+  snprintf(b, sizeof(b), TRS("RESETA EM \xE2\x80\xA2 %s", "RESETS \xE2\x80\xA2 %s"), c);
+  lv_label_set_text(g_ui.agAt7, b);
+
   set_hdr_status();
+}
+
+// Tendência da janela 5h: histórico + projeção pontilhada até esgotar.
+static void trend_redraw() {
+  if (!g_ui.trHist) return;
+  time_t now = time(nullptr);
+  uint32_t we = g_usage.h5ResetEpoch;
+  bool clockOk = (now > 1000000000L) && we != 0;
+
+  if (!clockOk) {
+    lv_line_set_points(g_ui.trHist, g_trPts, 0);
+    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
+    lv_obj_add_flag(g_ui.trDot, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(g_ui.trCap, TRS("Aguardando dados da janela...", "Waiting for window data..."));
+    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_MUTED), 0);
+    return;
+  }
+  uint32_t ws = we - 5 * 3600;
+
+  // horários do eixo
+  char t0[12], t1[12], b[112];
+  fmt_hm(ws, t0, sizeof(t0)); fmt_hm(we, t1, sizeof(t1));
+  lv_label_set_text(g_ui.trT0, t0);
+  lv_label_set_text(g_ui.trT1, t1);
+
+  // pontos do histórico dentro da janela
+  int n = 0;
+  for (int i = 0; i < g_histN && n < HIST_MAX; i++) {
+    Sample s = g_hist[hist_idx(i)];
+    if (s.t == 0 || s.t < ws || s.t > (uint32_t)now) continue;
+    g_trPts[n].x = tr_x(s.t, ws, we);
+    g_trPts[n].y = tr_y(s.h5);
+    n++;
+  }
+  // ponto atual (leitura mais recente)
+  uint32_t nowClamped = ((uint32_t)now > we) ? we : (uint32_t)now;
+  if (n < HIST_MAX) {
+    g_trPts[n].x = tr_x(nowClamped, ws, we);
+    g_trPts[n].y = tr_y(g_usage.h5);
+    n++;
+  }
+  lv_line_set_points(g_ui.trHist, g_trPts, n);
+
+  int cx = tr_x(nowClamped, ws, we), cy = tr_y(g_usage.h5);
+  lv_obj_set_pos(g_ui.trDot, cx - 4, cy - 4);
+  lv_obj_clear_flag(g_ui.trDot, LV_OBJ_FLAG_HIDDEN);
+
+  if (n < 3) {
+    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
+    lv_label_set_text(g_ui.trCap, TRS("Coletando dados... (~alguns minutos)",
+                                      "Collecting data... (~a few minutes)"));
+    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_MUTED), 0);
+    return;
+  }
+
+  // taxa: janela dos últimos 45 min
+  float rate = 0;                    // %/min
+  {
+    Sample first = {0, 0, 0};
+    for (int i = 0; i < g_histN; i++) {
+      Sample s = g_hist[hist_idx(i)];
+      if (s.t == 0 || s.t < ws) continue;
+      if (s.t >= (uint32_t)now - 2700) { first = s; break; }
+    }
+    if (first.t != 0 && (uint32_t)now > first.t + 300) {
+      float dt = ((uint32_t)now - first.t) / 60.0f;
+      rate = (g_usage.h5 - first.h5) / dt;
+    }
+  }
+
+  char e[32];
+  if (g_usage.h5 >= 99.5f) {
+    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
+    fmt_eta(we, e, sizeof(e));
+    snprintf(b, sizeof(b), TRS("Janela esgotada \xE2\x80\xA2 reseta em %s",
+                               "Window exhausted \xE2\x80\xA2 resets in %s"), e);
+    lv_label_set_text(g_ui.trCap, b);
+    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_BAD), 0);
+  } else if (rate > 0.02f) {
+    float minsLeft = (100.0f - g_usage.h5) / rate;
+    uint32_t etaT = (uint32_t)now + (uint32_t)(minsLeft * 60);
+    g_trProjPts[0].x = cx; g_trProjPts[0].y = cy;
+    if (etaT <= we) {
+      g_trProjPts[1].x = tr_x(etaT, ws, we);
+      g_trProjPts[1].y = tr_y(100);
+      char hm[12]; fmt_hm(etaT, hm, sizeof(hm));
+      snprintf(b, sizeof(b), TRS("No ritmo atual, esgota as %s (em %dh%02dm)",
+                                 "At this pace, runs out at %s (in %dh%02dm)"),
+               hm, (int)minsLeft / 60, (int)minsLeft % 60);
+      lv_label_set_text(g_ui.trCap, b);
+      lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(minsLeft < 60 ? C_BAD : C_WARN), 0);
+    } else {
+      float endPct = g_usage.h5 + rate * ((we - (uint32_t)now) / 60.0f);
+      g_trProjPts[1].x = tr_x(we, ws, we);
+      g_trProjPts[1].y = tr_y(endPct);
+      snprintf(b, sizeof(b), TRS("No ritmo atual, NAO esgota antes do reset (~%d%%)",
+                                 "At this pace, does NOT run out before reset (~%d%%)"),
+               (int)(endPct + 0.5f));
+      lv_label_set_text(g_ui.trCap, b);
+      lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_OK), 0);
+    }
+    lv_line_set_points(g_ui.trProj, g_trProjPts, 2);
+  } else {
+    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
+    lv_label_set_text(g_ui.trCap, TRS("Uso estavel \xE2\x80\xA2 sem risco no momento",
+                                      "Stable usage \xE2\x80\xA2 no risk right now"));
+    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_OK), 0);
+  }
+}
+
+static void heat_redraw() {
+  if (!g_ui.heat[0]) return;
+  float data[24];
+  heat_mode_data(g_heatMode, data);
+  float mx = 1.0f;
+  for (int h = 0; h < 24; h++) if (data[h] > mx) mx = data[h];
+  int curHour = -1; time_t now = time(nullptr);
+  if (now > 1000000000L) { struct tm tv; localtime_r(&now, &tv); curHour = tv.tm_hour; }
+  for (int h = 0; h < 24; h++) {
+    if (!g_ui.heat[h]) continue;
+    float r = data[h] / mx; if (r < 0) r = 0; if (r > 1) r = 1;
+    int hgt = 4 + (int)(r * 114);
+    lv_obj_set_size(g_ui.heat[h], 13, hgt);
+    lv_obj_set_y(g_ui.heat[h], 176 - hgt);
+    lv_obj_set_style_bg_color(g_ui.heat[h], lv_color_hex(h == curHour ? C_TEXT : C_ACCENT), 0);
+    lv_obj_set_style_bg_opa(g_ui.heat[h], (lv_opa_t)(70 + (int)(r * 185)), 0);
+  }
+}
+
+// ============================================================
+// Momentos — animações de limiar (25/50/70/100% nas janelas 5h e semanal)
+// Overlay em lv_layer_top: Clawd XL com "humor" por nível + contador de %
+// + medidor acendendo. Dispara ao cruzar o limiar; toque dispensa.
+// Animação 100% procedural (moment_tick no loop), sem lv_anim pendurado.
+// ============================================================
+static const uint8_t THR[4] = {25, 50, 70, 100};
+struct MomentUI {
+  lv_obj_t *scrim, *box, *img, *pct, *seg[NSEG];
+  lv_obj_t *lid[2], *drop[2], *ring, *xline[4];
+  int win, thr, fromPct;
+  int boxY;
+  uint32_t t0;
+};
+static MomentUI g_mo = {};
+static uint32_t g_momentUntil = 0;
+static int g_pendWin = -1, g_pendThr = 0;      // momento aguardando exibição
+static uint8_t g_thrFired[2] = {0, 0};         // bits já disparados por janela
+static float g_thrPrev[2] = {-1, -1};
+static bool g_thrBase = false;
+static lv_point_precise_t g_moXPts[4][2];      // olhos em X (KO)
+
+// Detecta cruzamento de limiar após cada fetch. Baseline no 1º fetch (não
+// dispara pelo que já estava acima); zera quando a janela reseta (queda >15pp).
+static void check_thresholds() {
+  float c[2] = {g_usage.h5, g_usage.d7};
+  for (int w = 0; w < 2; w++) {
+    if (!g_thrBase || (g_thrPrev[w] - c[w]) > 15.0f) {
+      g_thrFired[w] = 0;
+      for (int i = 0; i < 4; i++) if (c[w] >= THR[i]) g_thrFired[w] |= 1 << i;
+    } else {
+      int hit = -1;
+      for (int i = 0; i < 4; i++)
+        if (c[w] >= THR[i] && !(g_thrFired[w] & (1 << i))) { g_thrFired[w] |= 1 << i; hit = i; }
+      if (hit >= 0) { g_pendWin = w; g_pendThr = THR[hit]; }
+    }
+    g_thrPrev[w] = c[w];
+  }
+  g_thrBase = true;
+}
+
+static void moment_close() {
+  if (!g_mo.scrim) return;
+  lv_obj_delete(g_mo.scrim);
+  memset(&g_mo, 0, sizeof(g_mo));
+}
+static void moment_close_cb(lv_event_t *e) { (void)e; moment_close(); }
+
+static void show_moment(int win, int thr) {
+  moment_close();
+  g_mo.win = win; g_mo.thr = thr;
+  g_mo.fromPct = (thr == 25) ? 0 : (thr == 50) ? 25 : (thr == 70) ? 50 : 70;
+  g_mo.t0 = millis();
+  g_momentUntil = g_mo.t0 + 4600;
+
+  lv_obj_t *s = lv_obj_create(lv_layer_top());
+  g_mo.scrim = s;
+  lv_obj_set_pos(s, 0, 0); lv_obj_set_size(s, 480, 320);
+  lv_obj_set_style_bg_color(s, lv_color_hex(0x0D0D10), 0);
+  lv_obj_set_style_bg_opa(s, 248, 0);
+  lv_obj_set_style_border_width(s, 0, 0);
+  lv_obj_set_style_radius(s, 0, 0);
+  lv_obj_set_style_pad_all(s, 0, 0);
+  lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(s, moment_close_cb, LV_EVENT_CLICKED, NULL);
+
+  // anel de alerta (só no 100%; pisca no tick)
+  if (thr == 100) {
+    g_mo.ring = lv_obj_create(s);
+    lv_obj_set_pos(g_mo.ring, 4, 4); lv_obj_set_size(g_mo.ring, 472, 312);
+    lv_obj_set_style_bg_opa(g_mo.ring, 0, 0);
+    lv_obj_set_style_radius(g_mo.ring, 14, 0);
+    lv_obj_set_style_border_width(g_mo.ring, 4, 0);
+    lv_obj_set_style_border_color(g_mo.ring, lv_color_hex(C_BAD), 0);
+    lv_obj_clear_flag(g_mo.ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_mo.ring, LV_OBJ_FLAG_CLICKABLE);
+  }
+
+  // caixa do Clawd (a caixa inteira anima: bounce / shake / queda de entrada)
+  g_mo.boxY = 110;
+  lv_obj_t *bx = lv_obj_create(s);
+  g_mo.box = bx;
+  lv_obj_set_pos(bx, 36, g_mo.boxY - 40);
+  lv_obj_set_size(bx, 176, 116);
+  lv_obj_set_style_bg_opa(bx, 0, 0);
+  lv_obj_set_style_border_width(bx, 0, 0);
+  lv_obj_set_style_pad_all(bx, 0, 0);
+  lv_obj_clear_flag(bx, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(bx, LV_OBJ_FLAG_CLICKABLE);
+
+  g_mo.img = lv_image_create(bx);
+  lv_image_set_src(g_mo.img, &img_clawd_xl);
+  lv_obj_set_pos(g_mo.img, 0, 0);
+
+  // humores (sobre os buracos dos olhos do sprite)
+  const int ex[2] = {CLAWD_XL_EYE0_X, CLAWD_XL_EYE1_X};
+  const int ey = CLAWD_XL_EYE0_Y, ew = CLAWD_XL_EYE0_W, eh = CLAWD_XL_EYE0_H;
+  if (thr == 50) {
+    // focado: pálpebras cobrindo metade dos olhos + 1 gota de suor
+    for (int i = 0; i < 2; i++)
+      g_mo.lid[i] = rrect(bx, ex[i] - 1, ey - 1, ew + 2, eh / 2 + 2, 0, C_ACCENT);
+    g_mo.drop[0] = rrect(bx, 150, 6, 8, 12, 4, 0x7DD3FC);
+  } else if (thr == 70) {
+    // preocupado: olhos arregalados + 2 gotas (a caixa treme no tick)
+    for (int i = 0; i < 2; i++)
+      g_mo.lid[i] = rrect(bx, ex[i] - 3, ey - 4, ew + 6, eh + 8, 2, 0x0D0D10);
+    g_mo.drop[0] = rrect(bx, 150, 6, 8, 12, 4, 0x7DD3FC);
+    g_mo.drop[1] = rrect(bx, 18, 12, 8, 12, 4, 0x7DD3FC);
+  } else if (thr == 100) {
+    // KO: corpo acinzentado + olhos em X
+    lv_obj_set_style_image_recolor(g_mo.img, lv_color_hex(0x6A6A74), 0);
+    lv_obj_set_style_image_recolor_opa(g_mo.img, 190, 0);
+    for (int i = 0; i < 2; i++) {
+      g_moXPts[i * 2][0]     = { (lv_value_precise_t)(ex[i] - 2), (lv_value_precise_t)(ey - 1) };
+      g_moXPts[i * 2][1]     = { (lv_value_precise_t)(ex[i] + ew + 2), (lv_value_precise_t)(ey + eh + 1) };
+      g_moXPts[i * 2 + 1][0] = { (lv_value_precise_t)(ex[i] + ew + 2), (lv_value_precise_t)(ey - 1) };
+      g_moXPts[i * 2 + 1][1] = { (lv_value_precise_t)(ex[i] - 2), (lv_value_precise_t)(ey + eh + 1) };
+      for (int k = 0; k < 2; k++) {
+        lv_obj_t *ln = lv_line_create(bx);
+        lv_line_set_points(ln, g_moXPts[i * 2 + k], 2);
+        lv_obj_set_style_line_width(ln, 4, 0);
+        lv_obj_set_style_line_color(ln, lv_color_hex(C_BAD), 0);
+        lv_obj_set_style_line_rounded(ln, true, 0);
+        g_mo.xline[i * 2 + k] = ln;
+      }
+    }
+  }
+
+  // coluna de texto à direita
+  lv_obj_t *win_l = mklabel(s, win == 0 ? TRS("JANELA DE 5 HORAS", "5-HOUR WINDOW")
+                                        : TRS("JANELA SEMANAL", "WEEKLY WINDOW"),
+                            &lv_font_montserrat_20, C_MUTED);
+  lv_obj_set_pos(win_l, 240, 42);
+  g_mo.pct = tlabel(s, &lv_font_montserrat_48, C_OK, 240, 70);
+  const char *MSG[4] = {
+    TRS("Comecando \xE2\x80\xA2 ritmo tranquilo",       "Just starting \xE2\x80\xA2 easy pace"),
+    TRS("Metade da janela usada",                       "Half the window used"),
+    TRS("Atencao \xE2\x80\xA2 uso alto",                "Heads up \xE2\x80\xA2 heavy usage"),
+    TRS("Limite atingido \xE2\x80\xA2 aguarde o reset", "Limit reached \xE2\x80\xA2 wait for the reset"),
+  };
+  int mi = (thr == 25) ? 0 : (thr == 50) ? 1 : (thr == 70) ? 2 : 3;
+  lv_obj_t *msg = mklabel(s, MSG[mi], &lv_font_montserrat_16, C_TEXT);
+  lv_obj_set_pos(msg, 240, 148);
+  lv_obj_set_width(msg, 232);
+  lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+
+  for (int i = 0; i < NSEG; i++)
+    g_mo.seg[i] = rrect(s, 240 + i * 11, 196, 8, 16, 2, C_TRACK);
+
+  char e[32], b[48];
+  fmt_eta(win == 0 ? g_usage.h5ResetEpoch : g_usage.d7ResetEpoch, e, sizeof(e));
+  snprintf(b, sizeof(b), TRS("reseta em %s", "resets in %s"), e);
+  lv_obj_t *eta = mklabel(s, b, &lv_font_montserrat_14, C_FAINT);
+  lv_obj_set_pos(eta, 240, 228);
+
+  lv_obj_t *hint = mklabel(s, TRS("toque para fechar", "tap to close"), &lv_font_montserrat_12, C_FAINT);
+  lv_obj_set_pos(hint, 352, 296);
+}
+
+// Anima o momento (chamado a cada frame do loop enquanto o overlay existe).
+static void moment_tick() {
+  if (!g_mo.scrim) return;
+  uint32_t t = millis() - g_mo.t0;
+
+  // entrada: Clawd cai de cima com acomodação; depois o humor manda
+  int y = g_mo.boxY, x = 36;
+  if (t < 450) {
+    float p = t / 450.0f;
+    y = g_mo.boxY - (int)((1.0f - p) * (1.0f - p) * 60.0f);
+  } else if (g_mo.thr == 25 || g_mo.thr == 50) {
+    y = g_mo.boxY + (int)(4.0f * sinf((t - 450) / 260.0f));           // bounce feliz
+  } else if (g_mo.thr == 70) {
+    x = 36 + (((t / 70) % 2) ? 2 : -2);                                // treme
+  } else if (g_mo.thr == 100) {
+    y = g_mo.boxY + 6;                                                 // caído
+  }
+  lv_obj_set_pos(g_mo.box, x, y);
+
+  // contador de % (200ms..1100ms) + medidor acendendo em sequência
+  float p = (t < 200) ? 0 : (t > 1100 ? 1.0f : (t - 200) / 900.0f);
+  float v = g_mo.fromPct + (g_mo.thr - g_mo.fromPct) * p;
+  char b[12]; snprintf(b, sizeof(b), "%d%%", (int)(v + 0.5f));
+  lv_label_set_text(g_mo.pct, b);
+  lv_obj_set_style_text_color(g_mo.pct, grad_color(v), 0);
+  set_meter(g_mo.seg, v);
+
+  // gotas de suor caindo em ciclo
+  for (int i = 0; i < 2; i++) {
+    if (!g_mo.drop[i]) continue;
+    uint32_t c = (t + i * 450) % 900;
+    lv_obj_set_y(g_mo.drop[i], (i ? 12 : 6) + (int)(c * 34 / 900));
+    lv_obj_set_style_bg_opa(g_mo.drop[i], (lv_opa_t)(255 - c * 190 / 900), 0);
+  }
+  // anel vermelho piscando (100%)
+  if (g_mo.ring)
+    lv_obj_set_style_border_opa(g_mo.ring, ((t / 350) % 2) ? 190 : 30, 0);
+
+  if (millis() > g_momentUntil) moment_close();
 }
 
 // Preenche todos os valores vindos do fetch (sem rebuild de tela).
 static void refresh_ui_values() {
-  if (g_state != ST_MAIN || !g_ui.ovChip) return;
+  if (g_state != ST_MAIN || !g_ui.agPct5) return;
   char b[96];
 
-  // Overview
-  set_chip(g_ui.ovChip, g_usage.statusOverall, status_color(g_usage.statusOverall));
-  snprintf(b, sizeof(b), "%d%%", (int)(g_usage.h5 + 0.5f)); lv_label_set_text(g_ui.ovPct5, b);
-  lv_obj_set_style_text_color(g_ui.ovPct5, lv_color_hex(pct_color(g_usage.h5)), 0);
-  lv_bar_set_value(g_ui.ovBar5, (int)(g_usage.h5 + 0.5f), LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(g_ui.ovBar5, lv_color_hex(pct_color(g_usage.h5)), LV_PART_INDICATOR);
-  snprintf(b, sizeof(b), "%d%%", (int)(g_usage.d7 + 0.5f)); lv_label_set_text(g_ui.ovPct7, b);
-  lv_obj_set_style_text_color(g_ui.ovPct7, lv_color_hex(pct_color(g_usage.d7)), 0);
-  lv_bar_set_value(g_ui.ovBar7, (int)(g_usage.d7 + 0.5f), LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(g_ui.ovBar7, lv_color_hex(pct_color(g_usage.d7)), LV_PART_INDICATOR);
+  // Agora: percentuais + medidores segmentados (cor desliza verde -> vermelho)
+  snprintf(b, sizeof(b), "%d%%", (int)(g_usage.h5 + 0.5f)); lv_label_set_text(g_ui.agPct5, b);
+  lv_obj_set_style_text_color(g_ui.agPct5, grad_color(g_usage.h5), 0);
+  set_meter(g_ui.seg5, g_usage.h5);
+  snprintf(b, sizeof(b), "%d%%", (int)(g_usage.d7 + 0.5f)); lv_label_set_text(g_ui.agPct7, b);
+  lv_obj_set_style_text_color(g_ui.agPct7, grad_color(g_usage.d7), 0);
+  set_meter(g_ui.seg7, g_usage.d7);
 
-  // Reset (chips de status; countdowns no dash_tick)
-  if (g_ui.rcChip5) set_chip(g_ui.rcChip5, g_usage.status5h, status_color(g_usage.status5h));
-  if (g_ui.rcChip7) set_chip(g_ui.rcChip7, g_usage.status7d, status_color(g_usage.status7d));
+  set_chip(g_ui.agChip, overall_label(g_usage.statusOverall), status_color(g_usage.statusOverall));
+  update_tok_row();
 
-  // Modelos / incidente
+  // Modelos: chips de sonda + incidente
+  for (int i = 0; i < NMODELS; i++) {
+    if (!g_ui.mChip[i]) continue;
+    char txt[16]; uint32_t col;
+    model_chip(i, txt, sizeof(txt), &col);
+    set_chip(g_ui.mChip[i], txt, col);
+    lv_obj_update_layout(g_ui.mChip[i]);
+    static const int CENTERS[NMODELS] = {60, 180, 300, 420};
+    lv_obj_set_x(g_ui.mChip[i], CENTERS[i] - lv_obj_get_width(g_ui.mChip[i]) / 2);
+  }
   if (g_ui.incident) {
     bool any = !(g_status.haikuUp && g_status.sonnetUp && g_status.opusUp && g_status.fableUp);
-    lv_label_set_text(g_ui.incident, !g_status.ok ? "Status: sem dados"
-                      : (any ? "Incidente ativo - veja status.claude.com" : "Todos os modelos OK - sem incidentes"));
-    lv_obj_set_style_text_color(g_ui.incident, lv_color_hex(any ? C_WARN : C_MUTED), 0);
+    lv_label_set_text(g_ui.incident,
+        !g_status.ok ? TRS("status.claude.com: sem dados", "status.claude.com: no data")
+        : (any ? TRS("Incidente ativo \xE2\x80\xA2 veja status.claude.com",
+                     "Active incident \xE2\x80\xA2 see status.claude.com")
+               : TRS("status.claude.com: OK \xE2\x80\xA2 sem incidentes",
+                     "status.claude.com: OK \xE2\x80\xA2 no incidents")));
+    lv_obj_set_style_text_color(g_ui.incident, lv_color_hex(any ? C_WARN : C_FAINT), 0);
   }
 
-  // Tendência (chart + burn-rate)
-  if (g_ui.chart) {
-    int n = 40;
-    for (int i = 0; i < n; i++) {
-      int hi = g_histN - n + i;
-      if (hi < 0) {
-        lv_chart_set_value_by_id(g_ui.chart, g_ui.ser5, i, LV_CHART_POINT_NONE);
-        lv_chart_set_value_by_id(g_ui.chart, g_ui.ser7, i, LV_CHART_POINT_NONE);
-      } else {
-        lv_chart_set_value_by_id(g_ui.chart, g_ui.ser5, i, g_hist[hist_idx(hi)].h5);
-        lv_chart_set_value_by_id(g_ui.chart, g_ui.ser7, i, g_hist[hist_idx(hi)].d7);
-      }
-    }
-    lv_chart_refresh(g_ui.chart);
-  }
-  if (g_ui.burn) { char s[96]; burn_text(s, sizeof(s)); lv_label_set_text(g_ui.burn, s); }
-
-  // Detalhes minimalista: quem te limita primeiro + overage
-  if (g_ui.dvClaim) {
-    bool c5 = (strcmp(g_usage.repClaim, "five_hour") == 0);
-    lv_label_set_text(g_ui.dvClaim, g_usage.repClaim[0] ? (c5 ? "5 HORAS" : "7 DIAS") : "--");
-  }
-  if (g_ui.dvOverage) {
-    bool rej = (strcmp(g_usage.overageStatus, "rejected") == 0);
-    if (rej) snprintf(b, sizeof(b), "Overage indisponivel%s%s", g_usage.overageReason[0] ? ": " : "", g_usage.overageReason);
-    else     snprintf(b, sizeof(b), "Overage: %s", g_usage.overageStatus[0] ? g_usage.overageStatus : "--");
-    lv_label_set_text(g_ui.dvOverage, b);
-  }
-
-  // Heatmap por hora
-  if (g_ui.heat[0]) {
-    float mx = 1.0f;
-    for (int h = 0; h < 24; h++) if (g_hourBurn[h] > mx) mx = g_hourBurn[h];
-    int curHour = -1; time_t now = time(nullptr);
-    if (now > 1000000000L) { struct tm tv; localtime_r(&now, &tv); curHour = tv.tm_hour; }
-    for (int h = 0; h < 24; h++) {
-      if (!g_ui.heat[h]) continue;
-      float r = g_hourBurn[h] / mx; if (r < 0) r = 0; if (r > 1) r = 1;
-      int hgt = 4 + (int)(r * 118);
-      lv_obj_set_size(g_ui.heat[h], 13, hgt);
-      lv_obj_set_y(g_ui.heat[h], 174 - hgt);
-      lv_obj_set_style_bg_color(g_ui.heat[h], lv_color_hex(h == curHour ? C_TEXT : C_ACCENT), 0);
-      lv_obj_set_style_bg_opa(g_ui.heat[h], (lv_opa_t)(70 + (int)(r * 185)), 0);
-    }
-  }
-
+  trend_redraw();
+  heat_redraw();
   dash_tick();
 }
 
@@ -1062,12 +1705,12 @@ static void refresh_ui_values() {
 static void set_hdr_status() {
   if (!g_hdrStatus) return;
   char buf[40]; uint32_t color;
-  if (g_refreshing)        { strcpy(buf, "atualizando...");     color = C_ACCENT; }
-  else if (!g_lastFetchOk) { strcpy(buf, "falha ao atualizar"); color = C_BAD; }
+  if (g_refreshing)        { strcpy(buf, TRS("atualizando...", "updating..."));      color = C_ACCENT; }
+  else if (!g_lastFetchOk) { strcpy(buf, TRS("falha ao atualizar", "update failed")); color = C_BAD; }
   else {
     uint32_t s = (millis() - g_lastOkMs) / 1000;
-    if (s < 60) snprintf(buf, sizeof(buf), "atualizado ha %us", (unsigned)s);
-    else        snprintf(buf, sizeof(buf), "atualizado ha %umin", (unsigned)(s / 60));
+    if (s < 60) snprintf(buf, sizeof(buf), TRS("atualizado ha %us", "updated %us ago"), (unsigned)s);
+    else        snprintf(buf, sizeof(buf), TRS("atualizado ha %umin", "updated %um ago"), (unsigned)(s / 60));
     color = C_MUTED;
   }
   lv_label_set_text(g_hdrStatus, buf);
@@ -1080,21 +1723,42 @@ static void ui_main() {
   lv_obj_t *scr = lv_screen_active();
   lv_obj_set_style_bg_color(scr, lv_color_hex(C_BG), 0);
 
-  // Header moderno
-  lv_obj_t *title = mklabel(scr, "Claude", &lv_font_montserrat_22, C_TEXT);
-  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 7);
-  g_hdrStatus = mklabel(scr, "", &lv_font_montserrat_12, C_MUTED);
-  lv_obj_align(g_hdrStatus, LV_ALIGN_TOP_RIGHT, -52, 12);
+  start_data_web();
 
-  lv_obj_t *gear = mkbtn(scr, LV_SYMBOL_SETTINGS, &lv_font_montserrat_18, C_SURFACE2, C_TEXT);
-  lv_obj_set_size(gear, 40, 30);
-  lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -8, 5);
+  // Header: Clawd + logotipo oficiais (toque longo = demo das animacoes)
+  lv_obj_t *hIcon = lv_image_create(scr);
+  lv_image_set_src(hIcon, &img_clawd_sm);
+  lv_obj_set_pos(hIcon, 14, 8);
+  lv_obj_t *hWord = lv_image_create(scr);
+  lv_image_set_src(hWord, &img_wordmark);
+  lv_obj_set_pos(hWord, 66, 8);
+  lv_obj_t *hSpot = lv_obj_create(scr);        // hotspot invisivel p/ demo
+  lv_obj_set_pos(hSpot, 8, 2); lv_obj_set_size(hSpot, 124, 40);
+  lv_obj_set_style_bg_opa(hSpot, 0, 0);
+  lv_obj_set_style_border_width(hSpot, 0, 0);
+  lv_obj_clear_flag(hSpot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(hSpot, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(hSpot, [](lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    static int di = 0;
+    static const int T[4] = {25, 50, 70, 100};
+    show_moment((di / 4) % 2, T[di % 4]);
+    di++;
+  }, LV_EVENT_LONG_PRESSED, NULL);
+
+  g_hdrStatus = mklabel(scr, "", &lv_font_montserrat_12, C_MUTED);
+  lv_obj_align(g_hdrStatus, LV_ALIGN_TOP_RIGHT, -74, 14);
+
+  lv_obj_t *gear = mkbtn(scr, LV_SYMBOL_SETTINGS, &lv_font_montserrat_20, C_SURFACE2, C_TEXT);
+  lv_obj_set_size(gear, 58, 40);
+  lv_obj_set_ext_click_area(gear, 12);
+  lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -6, 2);
   lv_obj_add_event_cb(gear, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)ST_SETTINGS);
 
   // Barra fina decrescente do próximo refresh (toque = atualizar agora)
   g_ui.refBar = lv_bar_create(scr);
   lv_obj_set_size(g_ui.refBar, 480, 3);
-  lv_obj_set_pos(g_ui.refBar, 0, 38);
+  lv_obj_set_pos(g_ui.refBar, 0, 40);
   lv_bar_set_range(g_ui.refBar, 0, 1000);
   lv_bar_set_value(g_ui.refBar, 1000, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(g_ui.refBar, lv_color_hex(C_SURFACE), LV_PART_MAIN);
@@ -1102,11 +1766,12 @@ static void ui_main() {
   lv_obj_set_style_radius(g_ui.refBar, 0, LV_PART_MAIN);
   lv_obj_set_style_radius(g_ui.refBar, 0, LV_PART_INDICATOR);
   lv_obj_add_flag(g_ui.refBar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(g_ui.refBar, 10);
   lv_obj_add_event_cb(g_ui.refBar, refresh_cb, LV_EVENT_CLICKED, NULL);
 
   // Telas (swipe horizontal)
   g_ui.tv = lv_tileview_create(scr);
-  lv_obj_set_pos(g_ui.tv, 0, 44);
+  lv_obj_set_pos(g_ui.tv, 0, 46);
   lv_obj_set_size(g_ui.tv, 480, 250);
   lv_obj_set_style_bg_opa(g_ui.tv, 0, 0);
   lv_obj_set_style_border_width(g_ui.tv, 0, 0);
@@ -1115,12 +1780,10 @@ static void ui_main() {
     g_ui.tile[i] = lv_tileview_add_tile(g_ui.tv, i, 0, LV_DIR_HOR);
     tile_setup(g_ui.tile[i]);
   }
-  build_tile_overview(g_ui.tile[0]);
-  build_tile_reset(g_ui.tile[1]);
-  build_tile_models(g_ui.tile[2]);
-  build_tile_trend(g_ui.tile[3]);
-  build_tile_heat(g_ui.tile[4]);
-  build_tile_details(g_ui.tile[5]);
+  build_tile_agora(g_ui.tile[0]);
+  build_tile_models(g_ui.tile[1]);
+  build_tile_trend(g_ui.tile[2]);
+  build_tile_heat(g_ui.tile[3]);
   lv_obj_add_event_cb(g_ui.tv, on_tile_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
   // Dots (objetos; o ativo vira pílula)
@@ -1131,7 +1794,7 @@ static void ui_main() {
     lv_obj_set_style_bg_color(g_ui.dots[i], lv_color_hex(C_BORDER), 0);
     lv_obj_set_style_border_width(g_ui.dots[i], 0, 0);
     lv_obj_clear_flag(g_ui.dots[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(g_ui.dots[i], LV_ALIGN_BOTTOM_MID, (int)((i - (NTILES - 1) / 2.0f) * 16), -3);
+    lv_obj_align(g_ui.dots[i], LV_ALIGN_BOTTOM_MID, (int)((i - (NTILES - 1) / 2.0f) * 18), -4);
   }
 
   refresh_ui_values();
@@ -1139,10 +1802,11 @@ static void ui_main() {
 }
 
 // ============================================================
-// Tela: settings (navegação touch substitui o botão físico)
+// Tela: settings (lista rolável; linhas >=44px de toque)
 // ============================================================
 static bool g_wipeArmed = false;
-static lv_obj_t *g_briLbl = nullptr, *g_wipeLbl = nullptr, *g_pollLbl = nullptr, *g_tzLbl = nullptr;
+static lv_obj_t *g_briLbl = nullptr, *g_wipeLbl = nullptr, *g_pollLbl = nullptr,
+                *g_tzLbl = nullptr, *g_slideLbl = nullptr;
 static const int POLL_OPTS[4] = {30, 60, 120, 300};
 static const int TZ_OPTS[] = {-3, -4, -5, -6, -7, -8, -2, -1, 0, 1, 2, 3};
 #define NTZ ((int)(sizeof(TZ_OPTS) / sizeof(TZ_OPTS[0])))
@@ -1156,15 +1820,17 @@ static void settings_action_cb(lv_event_t *e) {
     case 3:                                            // brilho
       g_briIdx = (g_briIdx + 1) % 3; g_prefs.putInt("bri", g_briIdx); apply_brightness();
       if (g_briLbl) {
-        const char *n[3] = {"baixo", "medio", "alto"};
-        char m[24]; snprintf(m, sizeof(m), "Brilho: %s", n[g_briIdx]);
+        const char *n[3] = {TRS("baixo", "low"), TRS("medio", "medium"), TRS("alto", "high")};
+        char m[40]; snprintf(m, sizeof(m), TRS(LV_SYMBOL_EYE_OPEN "  Brilho: %s",
+                                               LV_SYMBOL_EYE_OPEN "  Brightness: %s"), n[g_briIdx]);
         lv_label_set_text(g_briLbl, m);
       }
       break;
     case 4:                                            // apagar tudo (2 toques)
       if (!g_wipeArmed) {
         g_wipeArmed = true;
-        if (g_wipeLbl) lv_label_set_text(g_wipeLbl, "Toque de novo p/ confirmar");
+        if (g_wipeLbl) lv_label_set_text(g_wipeLbl, TRS(LV_SYMBOL_TRASH "  Toque de novo p/ confirmar",
+                                                        LV_SYMBOL_TRASH "  Tap again to confirm"));
       } else {
         g_wipeArmed = false;
         factory_reset();
@@ -1179,8 +1845,10 @@ static void settings_action_cb(lv_event_t *e) {
       g_prefs.putInt("poll", g_pollSec);
       if (g_pollLbl) {
         char m[40];
-        if (g_pollSec < 60) snprintf(m, sizeof(m), LV_SYMBOL_LOOP "  Atualizar: %ds", g_pollSec);
-        else snprintf(m, sizeof(m), LV_SYMBOL_LOOP "  Atualizar: %dmin", g_pollSec / 60);
+        if (g_pollSec < 60) snprintf(m, sizeof(m), TRS(LV_SYMBOL_LOOP "  Atualizar: %ds",
+                                                       LV_SYMBOL_LOOP "  Refresh: %ds"), g_pollSec);
+        else snprintf(m, sizeof(m), TRS(LV_SYMBOL_LOOP "  Atualizar: %dmin",
+                                        LV_SYMBOL_LOOP "  Refresh: %dmin"), g_pollSec / 60);
         lv_label_set_text(g_pollLbl, m);
       }
       break;
@@ -1191,46 +1859,153 @@ static void settings_action_cb(lv_event_t *e) {
       g_tzOffset = TZ_OPTS[(idx + 1) % NTZ];
       g_prefs.putInt("tz", g_tzOffset);
       apply_tz();
-      if (g_tzLbl) { char m[32]; snprintf(m, sizeof(m), LV_SYMBOL_GPS "  Fuso: GMT%+d", g_tzOffset); lv_label_set_text(g_tzLbl, m); }
+      if (g_tzLbl) {
+        char m[40];
+        snprintf(m, sizeof(m), TRS(LV_SYMBOL_GPS "  Fuso: GMT%+d",
+                                   LV_SYMBOL_GPS "  Timezone: GMT%+d"), g_tzOffset);
+        lv_label_set_text(g_tzLbl, m);
+      }
       break;
     }
+    case 8: {                                          // slideshow: off -> 5 -> 10 -> 15 -> 30 -> off
+      static const int SL[5] = {0, 5, 10, 15, 30};
+      int idx = 0;
+      for (int i = 0; i < 5; i++) if (SL[i] == g_slideSec) idx = i;
+      g_slideSec = SL[(idx + 1) % 5];
+      g_prefs.putInt("slide", g_slideSec);
+      if (g_slideLbl) {
+        char m[48];
+        if (g_slideSec) snprintf(m, sizeof(m), LV_SYMBOL_PLAY "  Slideshow: %ds", g_slideSec);
+        else            snprintf(m, sizeof(m), "%s", TRS(LV_SYMBOL_PLAY "  Slideshow: desligado",
+                                                         LV_SYMBOL_PLAY "  Slideshow: off"));
+        lv_label_set_text(g_slideLbl, m);
+      }
+      break;
+    }
+    case 9:                                            // idioma / language
+      g_lang ^= 1;
+      g_prefs.putInt("lang", g_lang);
+      request_state(ST_SETTINGS);                      // redesenha tudo no novo idioma
+      break;
+    case 10: request_state(ST_ABOUT); break;           // sobre / about
   }
 }
-static void add_setting_row(lv_obj_t *p, int y, const char *txt, int act, uint32_t fg, lv_obj_t **out) {
+static void add_setting_row(lv_obj_t *p, const char *txt, int act, uint32_t fg, lv_obj_t **out) {
   lv_obj_t *b = lv_button_create(p);
-  lv_obj_set_size(b, 452, 36);
-  lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
+  lv_obj_set_size(b, 444, 44);
   lv_obj_set_style_bg_color(b, lv_color_hex(C_SURFACE), 0);
-  lv_obj_set_style_radius(b, 10, 0);
-  lv_obj_t *l = mklabel(b, txt, &lv_font_montserrat_14, fg);
-  lv_obj_align(l, LV_ALIGN_LEFT_MID, 6, 0);
+  lv_obj_set_style_radius(b, 12, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_t *l = mklabel(b, txt, &lv_font_montserrat_16, fg);
+  lv_obj_align(l, LV_ALIGN_LEFT_MID, 8, 0);
   lv_obj_add_event_cb(b, settings_action_cb, LV_EVENT_CLICKED, (void *)(intptr_t)act);
   if (out) *out = l;
 }
 static void ui_settings() {
   lv_obj_t *scr = lv_screen_active();
   g_wipeArmed = false;
-  lv_obj_t *title = mklabel(scr, "Ajustes", &lv_font_montserrat_20, C_TEXT);
+  start_data_web();
+  lv_obj_t *title = mklabel(scr, TRS("Ajustes", "Settings"), &lv_font_montserrat_20, C_TEXT);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 10);
 
-  lv_obj_t *bk = mkbtn(scr, LV_SYMBOL_LEFT " Voltar", &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
-  lv_obj_align(bk, LV_ALIGN_TOP_RIGHT, -12, 8);
+  lv_obj_t *bk = mkbtn(scr, TRS(LV_SYMBOL_LEFT " Voltar", LV_SYMBOL_LEFT " Back"),
+                       &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
+  lv_obj_set_size(bk, 100, 32);
+  lv_obj_set_ext_click_area(bk, 6);
+  lv_obj_align(bk, LV_ALIGN_TOP_RIGHT, -12, 6);
   lv_obj_add_event_cb(bk, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(g_usage.ok ? ST_MAIN : ST_SETTINGS));
 
-  const char *n[3] = {"baixo", "medio", "alto"};
-  char bri[28]; snprintf(bri, sizeof(bri), LV_SYMBOL_EYE_OPEN "  Brilho: %s", n[g_briIdx]);
-  char pollTxt[40];
-  if (g_pollSec < 60) snprintf(pollTxt, sizeof(pollTxt), LV_SYMBOL_LOOP "  Atualizar: %ds", g_pollSec);
-  else                snprintf(pollTxt, sizeof(pollTxt), LV_SYMBOL_LOOP "  Atualizar: %dmin", g_pollSec / 60);
-  char tzTxt[32]; snprintf(tzTxt, sizeof(tzTxt), LV_SYMBOL_GPS "  Fuso: GMT%+d", g_tzOffset);
+  // lista rolável
+  lv_obj_t *lst = lv_obj_create(scr);
+  lv_obj_set_pos(lst, 8, 44);
+  lv_obj_set_size(lst, 464, 268);
+  lv_obj_set_style_bg_opa(lst, 0, 0);
+  lv_obj_set_style_border_width(lst, 0, 0);
+  lv_obj_set_style_pad_all(lst, 0, 0);
+  lv_obj_set_style_pad_row(lst, 8, 0);
+  lv_obj_set_flex_flow(lst, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_scroll_dir(lst, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(lst, LV_SCROLLBAR_MODE_AUTO);
 
-  add_setting_row(scr, 38,  LV_SYMBOL_REFRESH "  Atualizar agora", 0, C_TEXT, nullptr);
-  add_setting_row(scr, 78,  pollTxt,                               6, C_TEXT, &g_pollLbl);
-  add_setting_row(scr, 118, tzTxt,                                 7, C_TEXT, &g_tzLbl);
-  add_setting_row(scr, 158, LV_SYMBOL_WIFI    "  Configurar WiFi",  1, C_TEXT, nullptr);
-  add_setting_row(scr, 198, LV_SYMBOL_KEYBOARD"  Trocar token",     2, C_TEXT, nullptr);
-  add_setting_row(scr, 238, bri,                                    3, C_TEXT, &g_briLbl);
-  add_setting_row(scr, 278, LV_SYMBOL_TRASH   "  Apagar tudo",      4, C_BAD,  &g_wipeLbl);
+  const char *n[3] = {TRS("baixo", "low"), TRS("medio", "medium"), TRS("alto", "high")};
+  char bri[40]; snprintf(bri, sizeof(bri), TRS(LV_SYMBOL_EYE_OPEN "  Brilho: %s",
+                                               LV_SYMBOL_EYE_OPEN "  Brightness: %s"), n[g_briIdx]);
+  char pollTxt[40];
+  if (g_pollSec < 60) snprintf(pollTxt, sizeof(pollTxt), TRS(LV_SYMBOL_LOOP "  Atualizar: %ds",
+                                                             LV_SYMBOL_LOOP "  Refresh: %ds"), g_pollSec);
+  else                snprintf(pollTxt, sizeof(pollTxt), TRS(LV_SYMBOL_LOOP "  Atualizar: %dmin",
+                                                             LV_SYMBOL_LOOP "  Refresh: %dmin"), g_pollSec / 60);
+  char tzTxt[40]; snprintf(tzTxt, sizeof(tzTxt), TRS(LV_SYMBOL_GPS "  Fuso: GMT%+d",
+                                                     LV_SYMBOL_GPS "  Timezone: GMT%+d"), g_tzOffset);
+  char slideTxt[48];
+  if (g_slideSec) snprintf(slideTxt, sizeof(slideTxt), LV_SYMBOL_PLAY "  Slideshow: %ds", g_slideSec);
+  else            snprintf(slideTxt, sizeof(slideTxt), "%s", TRS(LV_SYMBOL_PLAY "  Slideshow: desligado",
+                                                                 LV_SYMBOL_PLAY "  Slideshow: off"));
+
+  add_setting_row(lst, TRS(LV_SYMBOL_REFRESH "  Atualizar agora",
+                           LV_SYMBOL_REFRESH "  Refresh now"),   0, C_TEXT, nullptr);
+  add_setting_row(lst, pollTxt,                                  6, C_TEXT, &g_pollLbl);
+  add_setting_row(lst, slideTxt,                                 8, C_TEXT, &g_slideLbl);
+  add_setting_row(lst, TRS(LV_SYMBOL_LIST "  Idioma: Portugues",
+                           LV_SYMBOL_LIST "  Language: English"), 9, C_TEXT, nullptr);
+  add_setting_row(lst, tzTxt,                                    7, C_TEXT, &g_tzLbl);
+  add_setting_row(lst, bri,                                      3, C_TEXT, &g_briLbl);
+  add_setting_row(lst, TRS(LV_SYMBOL_WIFI "  Configurar WiFi",
+                           LV_SYMBOL_WIFI "  Configure WiFi"),   1, C_TEXT, nullptr);
+  add_setting_row(lst, TRS(LV_SYMBOL_KEYBOARD "  Trocar token",
+                           LV_SYMBOL_KEYBOARD "  Change token"), 2, C_TEXT, nullptr);
+  add_setting_row(lst, TRS(LV_SYMBOL_FILE "  Sobre",
+                           LV_SYMBOL_FILE "  About"),           10, C_TEXT, nullptr);
+  add_setting_row(lst, TRS(LV_SYMBOL_TRASH "  Apagar tudo",
+                           LV_SYMBOL_TRASH "  Erase everything"), 4, C_BAD, &g_wipeLbl);
+}
+
+// ============================================================
+// Tela: sobre / about
+// ============================================================
+static void ui_about() {
+  lv_obj_t *scr = lv_screen_active();
+  start_data_web();
+
+  lv_obj_t *bk = mkbtn(scr, TRS(LV_SYMBOL_LEFT " Voltar", LV_SYMBOL_LEFT " Back"),
+                       &lv_font_montserrat_14, C_SURFACE2, C_MUTED);
+  lv_obj_set_size(bk, 100, 32);
+  lv_obj_set_ext_click_area(bk, 6);
+  lv_obj_align(bk, LV_ALIGN_TOP_RIGHT, -12, 6);
+  lv_obj_add_event_cb(bk, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)ST_SETTINGS);
+
+  lv_obj_t *mark = build_claude_mark(scr);
+  lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 0);
+
+  lv_obj_t *t = mklabel(scr, "Claude Usage Stick", &lv_font_montserrat_22, C_TEXT);
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 94);
+
+  char v[64];
+  snprintf(v, sizeof(v), "v" FW_VERSION " \xE2\x80\xA2 ESP32-S3 \xE2\x80\xA2 LVGL 9.2");
+  lv_obj_t *ver = mklabel(scr, v, &lv_font_montserrat_12, C_FAINT);
+  lv_obj_align(ver, LV_ALIGN_TOP_MID, 0, 122);
+
+  lv_obj_t *d = mklabel(scr, TRS("Medidor de uso do Claude Code em tempo real: "
+                                 "janelas de 5h e semanal direto da API da Anthropic.",
+                                 "Real-time Claude Code usage meter: "
+                                 "5-hour and weekly windows straight from the Anthropic API."),
+                        &lv_font_montserrat_14, C_MUTED);
+  lv_obj_set_width(d, 420);
+  lv_obj_set_style_text_align(d, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(d, LV_LABEL_LONG_WRAP);
+  lv_obj_align(d, LV_ALIGN_TOP_MID, 0, 146);
+
+  lv_obj_t *h = mklabel(scr, TRS("Tela: Guition JC4832W535 \xE2\x80\xA2 IPS 3.5\" 480x320 touch (AXS15231B)",
+                                 "Display: Guition JC4832W535 \xE2\x80\xA2 3.5\" IPS 480x320 touch (AXS15231B)"),
+                        &lv_font_montserrat_12, C_FAINT);
+  lv_obj_align(h, LV_ALIGN_TOP_MID, 0, 200);
+
+  lv_obj_t *devCap = mklabel(scr, TRS("Desenvolvido por", "Developed by"), &lv_font_montserrat_12, C_FAINT);
+  lv_obj_align(devCap, LV_ALIGN_TOP_MID, 0, 234);
+  lv_obj_t *dev = mklabel(scr, "Benevid Felix", &lv_font_montserrat_18, C_TEXT);
+  lv_obj_align(dev, LV_ALIGN_TOP_MID, 0, 254);
+  lv_obj_t *mail = mklabel(scr, "benevid@gmail.com", &lv_font_montserrat_14, C_ACCENT);
+  lv_obj_align(mail, LV_ALIGN_TOP_MID, 0, 282);
 }
 
 // ============================================================
@@ -1246,13 +2021,16 @@ static void nav_cb(lv_event_t *e) {
 // ============================================================
 static void render_state() {
   g_state = g_pending;
-  if (g_state != ST_TOKEN) stop_web();        // derruba o WebServer ao sair da tela de token
+  stop_web();                                 // cada tela sobe o servidor que precisa
+  moment_close();                             // overlay vive em lv_layer_top
+  lv_obj_clean(lv_layer_top());
   // invalida ponteiros vivos antes de destruir a tela antiga
   memset(&g_ui, 0, sizeof(g_ui));
   g_mascN = 0;
   g_pinDots = g_pinMsg = nullptr;
   g_tokMsg = nullptr;
   g_hdrStatus = nullptr;
+  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = nullptr;
 
   lv_obj_clean(lv_screen_active());
   lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(C_BG), 0);
@@ -1263,10 +2041,13 @@ static void render_state() {
     case ST_SETUP_PIN: ui_pin(); break;
     case ST_WIFI:      ui_wifi(); break;
     case ST_TOKEN:     ui_token(); break;
-    case ST_LOADING:   ui_loading(g_wifi.isConnected() ? g_wifi.getSSID().c_str() : "conectando WiFi"); break;
+    case ST_LOADING:   ui_loading(g_wifi.isConnected() ? g_wifi.getSSID().c_str()
+                                                       : TRS("conectando WiFi", "connecting WiFi")); break;
     case ST_MAIN:      ui_main(); break;
     case ST_SETTINGS:  ui_settings(); break;
-    case ST_ERROR:     ui_message("Falha", g_usage.error[0] ? g_usage.error : "sem dados", C_BAD); break;
+    case ST_ABOUT:     ui_about(); break;
+    case ST_ERROR:     ui_message(TRS("Falha", "Failed"),
+                                  g_usage.error[0] ? g_usage.error : TRS("sem dados", "no data"), C_BAD); break;
     default: break;
   }
 }
@@ -1282,6 +2063,14 @@ static void ensure_time() {
   Serial.println("[NTP] sync iniciado");
 }
 
+// Sonda o próximo modelo da rotação.
+static void probe_next_model() {
+  int mi = g_probeIdx % NMODELS;
+  g_probeIdx++;
+  probeModel(g_token, g_models[mi].id, g_models[mi].pr);
+  g_models[mi].atMs = millis();
+}
+
 // Primeiro load (mostra a tela de carregamento). Vai p/ ST_MAIN ou ST_ERROR.
 static void do_refresh() {
   ensure_time();
@@ -1289,6 +2078,8 @@ static void do_refresh() {
   if (ok) {
     fetchModelStatus(g_status); g_lastOkMs = millis(); g_lastFetchOk = true;
     hist_push(g_usage.h5, g_usage.d7); accumulate_heat(g_usage.h5); save_history();
+    check_thresholds();
+    probe_next_model();
   } else g_lastFetchOk = false;
   g_lastPollMs = millis();
   request_state(ok ? ST_MAIN : ST_ERROR);
@@ -1303,18 +2094,21 @@ static void bg_refresh() {
   g_refreshing = true; set_hdr_status(); lv_refr_now(NULL);
   UsageData u = {};
   bool ok = fetchUsage(g_token, u);
-  bool stChanged = false;
+  bool rebuild = false;
   if (ok) {
     g_usage = u; g_lastOkMs = millis(); g_lastFetchOk = true;
     hist_push(u.h5, u.d7); accumulate_heat(u.h5); save_history();
-    ModelStatus old = g_status;
+    check_thresholds();
+    int moodBefore[NMODELS];
+    for (int i = 0; i < NMODELS; i++) moodBefore[i] = model_mood(i);
     fetchModelStatus(g_status);
-    stChanged = old.haikuUp != g_status.haikuUp || old.sonnetUp != g_status.sonnetUp ||
-                old.opusUp  != g_status.opusUp  || old.fableUp  != g_status.fableUp;
+    probe_next_model();
+    for (int i = 0; i < NMODELS; i++)
+      if (moodBefore[i] != model_mood(i)) rebuild = true;   // mascote muda de humor
   } else g_lastFetchOk = false;
   g_refreshing = false;
   g_lastPollMs = millis();
-  if (stChanged) request_state(ST_MAIN);  // mascotes mudaram -> rebuild
+  if (rebuild) request_state(ST_MAIN);    // mascotes mudaram -> rebuild
   else refresh_ui_values();               // resto: in-place (preserva o tile atual)
 }
 
@@ -1373,10 +2167,10 @@ void setup() {
 void loop() {
   lv_task_handler();
 
-  // Servidor web da tela de token
-  if (g_state == ST_TOKEN && g_web) {
+  // Servidor web (token no onboarding; /window + /tokens no dashboard)
+  if (g_web) {
     g_web->handleClient();
-    if (g_tokenGot) { g_tokenGot = false; request_state(ST_SETUP_PIN); }
+    if (g_state == ST_TOKEN && g_tokenGot) { g_tokenGot = false; request_state(ST_SETUP_PIN); }
   }
 
   if (g_dirty) {
@@ -1396,12 +2190,13 @@ void loop() {
     bg_refresh();           // seta g_lastPollMs no fim
   }
 
-  // Atualização viva: contadores (1s), barra de refresh (250ms), mascotes (bob+pisca)
+  // Atualização viva: contadores (1s), barra de refresh (250ms), mascotes,
+  // slideshow (5s, pausa 10s após qualquer toque)
   if (g_state == ST_MAIN) {
     uint32_t now = millis();
     static uint32_t lastTick = 0, lastBar = 0, lastBob = 0, blinkAt = 0;
     static bool blinkClosed = false;
-    if (now - lastTick > 1000) { lastTick = now; dash_tick(); }
+    if (now - lastTick > 1000) { lastTick = now; dash_tick(); update_tok_row(); }
     if (now - lastBar > 250 && g_ui.refBar) {
       lastBar = now;
       int v;
@@ -1412,24 +2207,48 @@ void loop() {
       }
       lv_bar_set_value(g_ui.refBar, v, LV_ANIM_OFF);
     }
-    if (now - lastBob > 80) {                       // bob suave dos mascotes online
+    if (now - lastBob > 80) {                       // animação por humor
       lastBob = now;
       float ph = now / 600.0f;
       for (int i = 0; i < g_mascN; i++) {
-        if (!g_masc[i].cont || !g_masc[i].up) continue;
-        int off = (int)(2.0f * sinf(ph + i * 0.9f) - 1.0f);   // -3..+1
-        lv_obj_set_y(g_masc[i].cont, g_masc[i].baseY + off);
+        if (!g_masc[i].cont) continue;
+        if (g_masc[i].mood == 1)                    // ok: bob alegre
+          lv_obj_set_y(g_masc[i].cont, g_masc[i].baseY + (int)(2.0f * sinf(ph + i * 0.9f) - 1.0f));
+        else if (g_masc[i].mood == 2) {             // limitado: bob curto + suor
+          lv_obj_set_y(g_masc[i].cont, g_masc[i].baseY + (int)(1.2f * sinf(ph * 0.6f + i)));
+          if (g_masc[i].drop) {
+            uint32_t cyc = (now + i * 300) % 900;
+            lv_obj_set_y(g_masc[i].drop, 24 + (int)(cyc * 22 / 900));
+            lv_obj_set_style_bg_opa(g_masc[i].drop, (lv_opa_t)(255 - cyc * 190 / 900), 0);
+          }
+        }
       }
     }
     uint32_t bp = blinkClosed ? 150 : 3000;
-    if (now - blinkAt > bp) {                        // piscar
+    if (now - blinkAt > bp) {                        // piscar (só quem está ok)
       blinkAt = now; blinkClosed = !blinkClosed;
       for (int i = 0; i < g_mascN; i++) {
-        if (!g_masc[i].up) continue;
-        for (int k = 0; k < 2; k++)
-          if (g_masc[i].eye[k]) lv_obj_set_height(g_masc[i].eye[k], blinkClosed ? 2 : g_masc[i].eyeH);
+        if (g_masc[i].mood != 1) continue;
+        for (int k = 0; k < 2; k++) {
+          if (!g_masc[i].lid[k]) continue;
+          if (blinkClosed) lv_obj_clear_flag(g_masc[i].lid[k], LV_OBJ_FLAG_HIDDEN);
+          else             lv_obj_add_flag(g_masc[i].lid[k], LV_OBJ_FLAG_HIDDEN);
+        }
       }
     }
+    if (g_slideSec > 0 && g_ui.tv && !g_refreshing && !g_mo.scrim &&
+        now - g_lastTouchMs > 10000 && now - g_lastSlideMs > (uint32_t)g_slideSec * 1000) {
+      g_lastSlideMs = now;
+      int next = (g_curTile + 1) % NTILES;
+      lv_tileview_set_tile_by_index(g_ui.tv, next, 0, LV_ANIM_ON);
+    }
+
+    // Momentos de limiar: mostra pendente e anima o overlay ativo
+    if (g_pendWin >= 0 && !g_mo.scrim && !g_refreshing) {
+      show_moment(g_pendWin, g_pendThr);
+      g_pendWin = -1;
+    }
+    if (g_mo.scrim) moment_tick();
   }
 
   delay(5);

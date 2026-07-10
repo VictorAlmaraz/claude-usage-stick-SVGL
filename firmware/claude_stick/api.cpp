@@ -89,3 +89,32 @@ bool fetchUsage(const char* token, UsageData& out) {
     out.ok = true;
     return true;
 }
+
+bool probeModel(const char* token, const char* modelId, ProbeResult& out) {
+    WiFiClientSecure client;
+    client.setCACert(CA_BUNDLE);
+
+    HTTPClient https;
+    if (!https.begin(client, MESSAGES_ENDPOINT)) { out.code = -1; out.ms = 0; return false; }
+
+    https.addHeader("Authorization", String("Bearer ") + token);
+    https.addHeader("anthropic-version", ANTHROPIC_VERSION);
+    https.addHeader("anthropic-beta", "oauth-2025-04-20");
+    https.addHeader("content-type", "application/json");
+    https.addHeader("User-Agent", "claude-code/2.1.5");
+    https.setTimeout(API_TIMEOUT_MS);
+
+    String body = String("{\"model\":\"") + modelId + "\","
+                  "\"max_tokens\":1,"
+                  "\"messages\":[{\"role\":\"user\",\"content\":\".\"}]}";
+
+    uint32_t t0 = millis();
+    int code = https.POST(body);
+    uint32_t dt = millis() - t0;
+    https.end();
+
+    out.code = code;
+    out.ms = (dt > 65000) ? 65000 : (uint16_t)dt;
+    Serial.printf("[PROBE] %s -> HTTP %d (%ums)\n", modelId, code, (unsigned)dt);
+    return code == 200;
+}

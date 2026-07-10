@@ -23,3 +23,11 @@ struct UsageData {
 };
 
 bool fetchUsage(const char* token, UsageData& out);
+
+// Sonda leve de UM modelo (POST max_tokens:1): mede latência e código HTTP.
+// 200 = disponível · 429 = limitado p/ este plano/janela · 5xx = falha na API.
+struct ProbeResult {
+    int      code;   // código HTTP (0 = nunca sondado, <0 = erro de rede)
+    uint16_t ms;     // latência da requisição
+};
+bool probeModel(const char* token, const char* modelId, ProbeResult& out);
