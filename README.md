@@ -79,7 +79,7 @@ reacts to the level — relaxed at 25 %, focused with a sweat drop at 50 %, wide
 at 70 %, grayed-out with X eyes and a blinking red ring at 100 % — while the percentage counts
 up and a segment meter lights up. Tap to dismiss (auto-closes after ~4.5 s).
 
-> **Double-tap the Clawd icon** in the header to preview the 8 animations in sequence; **tap the CLAUDE CODE wordmark** to refresh immediately.
+> **Double-tap the Clawd icon or the CLAUDE CODE wordmark** to preview the 8 animations in sequence. The **refresh button** sits at the center of the header (the thin coral bar below it is just the countdown indicator).
 
 The header and the token/loading screens use the **official Claude Code pixel logo** (SVGs in
 `assets/brand/`, converted to embedded LVGL images by `tools/gen_logo_assets.py`).

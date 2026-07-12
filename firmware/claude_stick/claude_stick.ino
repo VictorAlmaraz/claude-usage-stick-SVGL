@@ -1725,9 +1725,8 @@ static void ui_main() {
 
   start_data_web();
 
-  // Header: Clawd + logotipo oficiais.
-  // Toque DUPLO no Clawd = demo das animacoes de limiar (cicla as 8).
-  // Toque no nome CLAUDE CODE = atualizar agora.
+  // Header: Clawd + logotipo (duplo toque em QUALQUER um = demo das animacoes),
+  // botao de ATUALIZAR visivel no centro, engrenagem grande a direita.
   lv_obj_t *hIcon = lv_image_create(scr);
   lv_image_set_src(hIcon, &img_clawd_sm);
   lv_obj_set_pos(hIcon, 14, 8);
@@ -1735,13 +1734,13 @@ static void ui_main() {
   lv_image_set_src(hWord, &img_wordmark);
   lv_obj_set_pos(hWord, 66, 8);
 
-  lv_obj_t *iconSpot = lv_obj_create(scr);     // hotspot do Clawd (duplo toque)
-  lv_obj_set_pos(iconSpot, 6, 2); lv_obj_set_size(iconSpot, 54, 40);
-  lv_obj_set_style_bg_opa(iconSpot, 0, 0);
-  lv_obj_set_style_border_width(iconSpot, 0, 0);
-  lv_obj_clear_flag(iconSpot, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(iconSpot, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(iconSpot, [](lv_event_t *e) {
+  lv_obj_t *logoSpot = lv_obj_create(scr);     // hotspot icone+nome (so demo)
+  lv_obj_set_pos(logoSpot, 6, 2); lv_obj_set_size(logoSpot, 128, 40);
+  lv_obj_set_style_bg_opa(logoSpot, 0, 0);
+  lv_obj_set_style_border_width(logoSpot, 0, 0);
+  lv_obj_clear_flag(logoSpot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(logoSpot, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(logoSpot, [](lv_event_t *e) {
     (void)e;
     static uint32_t lastClick = 0;             // duplo clique manual (9.2 nao tem nativo)
     static int di = 0;
@@ -1756,27 +1755,24 @@ static void ui_main() {
     }
   }, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *wordSpot = lv_obj_create(scr);     // hotspot do logotipo (atualizar)
-  lv_obj_set_pos(wordSpot, 62, 2); lv_obj_set_size(wordSpot, 68, 40);
-  lv_obj_set_style_bg_opa(wordSpot, 0, 0);
-  lv_obj_set_style_border_width(wordSpot, 0, 0);
-  lv_obj_clear_flag(wordSpot, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(wordSpot, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(wordSpot, [](lv_event_t *e) {
-    (void)e;
-    g_wantRefresh = true;                      // header mostra "atualizando..."
-  }, LV_EVENT_CLICKED, NULL);
+  // botao de atualizar no centro do header (acao explicita; a busca e bloqueante)
+  lv_obj_t *ref = mkbtn(scr, LV_SYMBOL_REFRESH, &lv_font_montserrat_20, C_SURFACE2, C_ACCENT);
+  lv_obj_set_size(ref, 56, 40);
+  lv_obj_set_ext_click_area(ref, 10);
+  lv_obj_align(ref, LV_ALIGN_TOP_MID, 0, 2);
+  lv_obj_add_event_cb(ref, refresh_cb, LV_EVENT_CLICKED, NULL);
 
   g_hdrStatus = mklabel(scr, "", &lv_font_montserrat_12, C_MUTED);
-  lv_obj_align(g_hdrStatus, LV_ALIGN_TOP_RIGHT, -74, 14);
+  lv_obj_align(g_hdrStatus, LV_ALIGN_TOP_RIGHT, -92, 16);
 
-  lv_obj_t *gear = mkbtn(scr, LV_SYMBOL_SETTINGS, &lv_font_montserrat_20, C_SURFACE2, C_TEXT);
-  lv_obj_set_size(gear, 58, 40);
-  lv_obj_set_ext_click_area(gear, 12);
+  lv_obj_t *gear = mkbtn(scr, LV_SYMBOL_SETTINGS, &lv_font_montserrat_22, C_SURFACE2, C_TEXT);
+  lv_obj_set_size(gear, 78, 40);
+  lv_obj_set_ext_click_area(gear, 16);
   lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -6, 2);
   lv_obj_add_event_cb(gear, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)ST_SETTINGS);
 
-  // Barra fina decrescente do próximo refresh (toque = atualizar agora)
+  // Barra fina decrescente do próximo refresh (só indicador; o botão de
+  // atualizar fica no centro do header — clique aqui causava refresh acidental)
   g_ui.refBar = lv_bar_create(scr);
   lv_obj_set_size(g_ui.refBar, 480, 3);
   lv_obj_set_pos(g_ui.refBar, 0, 40);
@@ -1786,9 +1782,7 @@ static void ui_main() {
   lv_obj_set_style_bg_color(g_ui.refBar, lv_color_hex(C_ACCENT), LV_PART_INDICATOR);
   lv_obj_set_style_radius(g_ui.refBar, 0, LV_PART_MAIN);
   lv_obj_set_style_radius(g_ui.refBar, 0, LV_PART_INDICATOR);
-  lv_obj_add_flag(g_ui.refBar, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_ext_click_area(g_ui.refBar, 10);
-  lv_obj_add_event_cb(g_ui.refBar, refresh_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_clear_flag(g_ui.refBar, LV_OBJ_FLAG_CLICKABLE);
 
   // Telas (swipe horizontal)
   g_ui.tv = lv_tileview_create(scr);
