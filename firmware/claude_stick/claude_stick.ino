@@ -1725,26 +1725,47 @@ static void ui_main() {
 
   start_data_web();
 
-  // Header: Clawd + logotipo oficiais (toque longo = demo das animacoes)
+  // Header: Clawd + logotipo oficiais.
+  // Toque DUPLO no Clawd = demo das animacoes de limiar (cicla as 8).
+  // Toque no nome CLAUDE CODE = atualizar agora.
   lv_obj_t *hIcon = lv_image_create(scr);
   lv_image_set_src(hIcon, &img_clawd_sm);
   lv_obj_set_pos(hIcon, 14, 8);
   lv_obj_t *hWord = lv_image_create(scr);
   lv_image_set_src(hWord, &img_wordmark);
   lv_obj_set_pos(hWord, 66, 8);
-  lv_obj_t *hSpot = lv_obj_create(scr);        // hotspot invisivel p/ demo
-  lv_obj_set_pos(hSpot, 8, 2); lv_obj_set_size(hSpot, 124, 40);
-  lv_obj_set_style_bg_opa(hSpot, 0, 0);
-  lv_obj_set_style_border_width(hSpot, 0, 0);
-  lv_obj_clear_flag(hSpot, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(hSpot, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(hSpot, [](lv_event_t *e) {
-    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+
+  lv_obj_t *iconSpot = lv_obj_create(scr);     // hotspot do Clawd (duplo toque)
+  lv_obj_set_pos(iconSpot, 6, 2); lv_obj_set_size(iconSpot, 54, 40);
+  lv_obj_set_style_bg_opa(iconSpot, 0, 0);
+  lv_obj_set_style_border_width(iconSpot, 0, 0);
+  lv_obj_clear_flag(iconSpot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(iconSpot, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(iconSpot, [](lv_event_t *e) {
+    (void)e;
+    static uint32_t lastClick = 0;             // duplo clique manual (9.2 nao tem nativo)
     static int di = 0;
-    static const int T[4] = {25, 50, 70, 100};
-    show_moment((di / 4) % 2, T[di % 4]);
-    di++;
-  }, LV_EVENT_LONG_PRESSED, NULL);
+    uint32_t now = millis();
+    if (now - lastClick < 450) {
+      static const int T[4] = {25, 50, 70, 100};
+      show_moment((di / 4) % 2, T[di % 4]);
+      di++;
+      lastClick = 0;
+    } else {
+      lastClick = now;
+    }
+  }, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *wordSpot = lv_obj_create(scr);     // hotspot do logotipo (atualizar)
+  lv_obj_set_pos(wordSpot, 62, 2); lv_obj_set_size(wordSpot, 68, 40);
+  lv_obj_set_style_bg_opa(wordSpot, 0, 0);
+  lv_obj_set_style_border_width(wordSpot, 0, 0);
+  lv_obj_clear_flag(wordSpot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(wordSpot, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(wordSpot, [](lv_event_t *e) {
+    (void)e;
+    g_wantRefresh = true;                      // header mostra "atualizando..."
+  }, LV_EVENT_CLICKED, NULL);
 
   g_hdrStatus = mklabel(scr, "", &lv_font_montserrat_12, C_MUTED);
   lv_obj_align(g_hdrStatus, LV_ALIGN_TOP_RIGHT, -74, 14);

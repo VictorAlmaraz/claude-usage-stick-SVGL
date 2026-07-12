@@ -6,7 +6,7 @@ straight from the response headers, and renders it all on a friendly dashboard �
 **Clawd** mascots, a usage trend chart, an hour-of-day heatmap and reset clocks.
 
 <p align="center">
-  <img src="assets/screen-overview.jpeg" width="520" alt="Claude Usage Stick overview screen">
+  <img src="assets/mock-agora.png" width="520" alt="Claude Usage Stick — Now screen (mockup)">
 </p>
 
 > 100% touch navigation (swipe ← → between screens, no physical button). Adapted from the original
@@ -20,11 +20,14 @@ straight from the response headers, and renders it all on a friendly dashboard �
 
 ## Screens
 
+> The images below are **pixel-accurate mockups** of the v2.1 layout (real device photos coming soon). Regenerate them with `python3 tools/gen_mockups.py`.
+
 Navigate by **swiping** (the dots at the bottom show your position; the active one becomes a
 pill). The **gear** opens Settings. The thin **coral bar** below the header counts down to the
 next refresh — tapping it refreshes immediately.
 
 ### 1. Now (*Agora*)
+<img src="assets/mock-agora.png" width="400" align="right" alt="Now screen">
 
 - Two big cards: **5-hour window** and **week (7-day) window**.
 - Each card: large percentage and an **18-segment meter** whose lit segments (and the number)
@@ -34,7 +37,10 @@ next refresh — tapping it refreshes immediately.
   [token bridge](#tokens-per-session-optional-bridge) is running, the **real token counts** for
   the current 5 h window.
 
+<br clear="right">
+
 ### 2. Models (*Modelos*)
+<img src="assets/mock-modelos.png" width="400" align="right" alt="Models screen">
 
 - The 4 Clawd mascots (Haiku / Sonnet / Opus / Fable) with a **live status pill** under each one,
   fed by a **real probe against the API** (one model per refresh cycle, rotating):
@@ -42,21 +48,30 @@ next refresh — tapping it refreshes immediately.
   `N/D` / `--` (gray). The mascot goes gray when the model is unreachable or under incident.
 - An **incident line** from `status.claude.com` (is the problem you or Anthropic?).
 
+<br clear="right">
+
 ### 3. 5-hour window (*Janela de 5h*)
+<img src="assets/mock-janela5h.png" width="400" align="right" alt="5-hour window screen">
 
 - Custom chart with the **X axis spanning exactly the current 5 h window** (start → reset).
 - Solid coral line = real usage history; **dotted line = projection** at the current burn rate.
 - Plain-language verdict, color-coded: *"At the current rate, runs out at 16:40 (in 1h32m)"*
   (amber/red) or *"Does NOT run out before the reset (~62%)"* (green).
 
+<br clear="right">
+
 ### 4. Hourly rhythm (*Ritmo por hora*)
+<img src="assets/mock-ritmo.png" width="400" align="right" alt="Hourly rhythm screen">
 
 - **Usage by hour of day**: 24 bars whose height/brightness show which hours burn the most quota;
   the current hour is highlighted.
 - **Period selector** at the top: **Hoje / 7d / 30d / Tudo** (today, last 7 days, last 30 days,
   all time). Per-day history is **persisted to flash** (31 days on the device).
 
+<br clear="right">
+
 ### Threshold moments (animations)
+<img src="assets/mock-momento.png" width="400" align="right" alt="Threshold moment overlay">
 
 Whenever a window crosses **25 % / 50 % / 70 % / 100 %**, a full-screen animated "moment" pops
 up (8 combinations: 4 thresholds × 2 windows): the official pixel-art **Clawd** drops in and
@@ -64,10 +79,12 @@ reacts to the level — relaxed at 25 %, focused with a sweat drop at 50 %, wide
 at 70 %, grayed-out with X eyes and a blinking red ring at 100 % — while the percentage counts
 up and a segment meter lights up. Tap to dismiss (auto-closes after ~4.5 s).
 
-> **Long-press the Claude Code logo** in the header to preview all 8 animations in sequence.
+> **Double-tap the Clawd icon** in the header to preview the 8 animations in sequence; **tap the CLAUDE CODE wordmark** to refresh immediately.
 
 The header and the token/loading screens use the **official Claude Code pixel logo** (SVGs in
 `assets/brand/`, converted to embedded LVGL images by `tools/gen_logo_assets.py`).
+
+<br clear="right">
 
 ### Settings (*Ajustes*)
 
@@ -274,7 +291,7 @@ firmware/
     build.sh                    # compile / flash / monitor
   bringup/                      # validated bring-up (hardware reference)
   REFERENCIA-HARDWARE-LVGL.md   # display/colors/touch that work
-assets/                         # screen screenshots
+assets/                         # mockups das telas + assets de marca (brand/)
 ```
 
 ## Where to tweak

@@ -230,3 +230,38 @@ arduino-cli monitor -p /dev/cu.usbmodem101 -c baudrate=115200
 - 🔴 **USB CDC On Boot** habilitado, senão o `Serial` não aparece na USB nativa.
 - 🟡 Display e touch precisam ter a **mesma orientação** (270°/rot=3 para USB à esquerda).
 - 🟡 LVGL **9.2.x** — API nova (`lv_display_create`, `lv_tick_set_cb`); exemplos antigos (v8) não compilam.
+
+## 14. Truques e pegadinhas LVGL 9.2 (aprendidos no redesign v2.x)
+
+> Descobertos na prática durante o redesign de 2026-07 (medidor segmentado, sprites
+> oficiais, animações de limiar, i18n). Valem para qualquer firmware desta placa.
+
+- 🔴 **Fontes Montserrat embutidas só têm ASCII + `°` (0xB0) + bullet `•` (0x2022).**
+  Nada de acentos nem travessão (—) — renderizam como glifo faltante. Escrever a UI sem
+  acento e usar o bullet UTF-8 (`"\xE2\x80\xA2"`) como separador visual.
+- 🔴 **Protótipos automáticos do `.ino` quebram com tipos próprios**: uma função que
+  retorna `MeuStruct*` ganha protótipo gerado NO TOPO do arquivo, antes da definição do
+  struct → erro `'MeuStruct' does not name a type`. Solução: retornar índice `int`
+  (ver `day_slot()` no sketch) ou usar só tipos já conhecidos (`lv_obj_t*` etc.).
+- 🟢 **Imagens embutidas (ARGB8888)**: `lv_image_dsc_t` na 9.2 aceita init posicional
+  `{{LV_IMAGE_HEADER_MAGIC, LV_COLOR_FORMAT_ARGB8888, 0, w, h, w*4, 0}, size, data}`
+  (ordem little-endian verificada em `src/draw/lv_image_dsc.h`). Bytes por pixel na
+  ordem **B,G,R,A**. Pipeline: `tools/gen_logo_assets.py` (rsvg-convert + Pillow)
+  rasteriza SVG → `logo_assets.h`.
+- 🟢 **`lv_obj_set_style_image_recolor(+_opa)`** tinge o sprite em runtime — usado para
+  deixar o Clawd cinza em estado de erro sem gerar um segundo asset.
+- 🟡 **Animações procedurais no `loop()` > `lv_anim`** para overlays que podem morrer a
+  qualquer momento (toque fecha): `lv_anim` com `exec_cb` custom apontando para objetos
+  deletados = crash. Padrão do firmware: guardar ponteiros num struct, animar por tempo
+  (`millis()`) e deletar tudo junto (`lv_obj_delete(scrim)`).
+- 🟡 **Overlays devem viver em `lv_layer_top()`** (sobrevivem a updates da tela), mas
+  precisam ser limpos manualmente em cada troca de estado (`lv_obj_clean(lv_layer_top())`
+  no `render_state()`), senão vazam entre telas.
+- 🟡 **Alvo de toque pequeno**: além de aumentar o botão, usar
+  `lv_obj_set_ext_click_area(btn, px)` — a engrenagem do header usa 58×40 + 12px extras.
+- 🟢 **i18n barato**: macro `#define TRS(pt, en) (g_lang ? (en) : (pt))` inline em cada
+  string (sem tabela paralela para desalinhar). Trocar idioma = salvar NVS +
+  `request_state()` para reconstruir a tela atual.
+- 🟢 **Olhos do Clawd oficial são buracos transparentes no path** — sobre fundo escuro já
+  parecem olhos; expressões viram overlays (pálpebras/X) posicionados pelos defines
+  `CLAWD_*_EYE*` que o gerador de assets emite.
