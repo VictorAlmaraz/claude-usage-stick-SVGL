@@ -119,6 +119,12 @@ Pins and the validated display/color/touch configuration are in
 [`firmware/REFERENCIA-HARDWARE-LVGL.md`](firmware/REFERENCIA-HARDWARE-LVGL.md) and the reference
 bring-up sketch in [`firmware/bringup/`](firmware/bringup/).
 
+### 3D-printable case
+
+A ready-to-print case for this display board is included:
+[`3D Case/Case_JC3248W535C.stl`](3D%20Case/Case_JC3248W535C.stl) — print it, slide the board in
+and the Usage Stick is desk-ready.
+
 ---
 
 ## How it works (and the token)
@@ -292,6 +298,7 @@ firmware/
   bringup/                      # validated bring-up (hardware reference)
   REFERENCIA-HARDWARE-LVGL.md   # display/colors/touch that work
 assets/                         # mockups das telas + assets de marca (brand/)
+3D Case/                        # case imprimível (STL) para a placa
 ```
 
 ## Where to tweak
