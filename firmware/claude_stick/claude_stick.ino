@@ -31,6 +31,7 @@
 #include "api.h"
 #include "status.h"
 #include "crypto.h"
+#include "sessions.h"
 #include "logo_assets.h"   // Clawd + logotipo oficiais (gerado por tools/gen_logo_assets.py)
 
 // ---- Paleta (escuro, minimalista; acento coral do Claude) ----
@@ -47,6 +48,7 @@
 #define C_OK       0x4ADE80
 #define C_WARN     0xFBBF24
 #define C_BAD      0xF87171
+#define C_INFO     0x60A5FA   // azul (sessao trabalhando)
 
 // ---- Idioma (0 = portugues, 1 = english; Ajustes -> NVS "lang") ----
 static uint8_t g_lang = 0;
@@ -144,7 +146,7 @@ static int g_mascN = 0;
 static lv_point_precise_t g_mXPts[NMODELS][4][2];   // olhos em X (mood 3)
 
 // ---- Ponteiros de UI do dashboard (zerados a cada build de ST_MAIN) ----
-#define NTILES 4
+#define NTILES 5
 #define NSEG 18                       // segmentos do medidor de janela
 struct DashUI {
   lv_obj_t *tv, *tile[NTILES], *dots[NTILES];
@@ -153,6 +155,11 @@ struct DashUI {
   lv_obj_t *agChip, *agPct5, *agCd5, *agAt5;
   lv_obj_t *agPct7, *agCd7, *agAt7, *agTok;
   lv_obj_t *seg5[NSEG], *seg7[NSEG];  // medidores segmentados
+  // sessoes do Claude Code (cards reconstruidos sob demanda)
+  lv_obj_t *sessList, *sessCount, *sessEmpty;
+  lv_obj_t *sessAgo[MAX_SESSIONS];    // label "2m14s" de cada card visivel
+  uint32_t  sessAt[MAX_SESSIONS];     // updatedAt correspondente
+  uint8_t   sessN;
   // modelos
   lv_obj_t *mChip[NMODELS], *incident;
   // tendência da janela 5h (linhas custom)
@@ -189,6 +196,8 @@ static void update_tok_row();
 static void show_moment(int win, int thr);
 static void moment_tick();
 static void moment_close();
+static void sessions_rebuild();
+static void sessions_tick();
 
 // ============================================================
 // Pipeline de display/touch (validado no bring-up)
@@ -290,6 +299,14 @@ static void fmt_hm(uint32_t epoch, char *out, int sz) {
   time_t t = (time_t)epoch; struct tm tmv;
   localtime_r(&t, &tmv);
   strftime(out, sz, "%H:%M", &tmv);
+}
+// tempo decorrido desde um millis(): "42s" / "2m14s" / "1h03m".
+// Aritmetica unsigned de proposito — sobrevive ao rollover de millis().
+static void fmt_ago(uint32_t sinceMs, char *out, int sz) {
+  uint32_t s = (millis() - sinceMs) / 1000;
+  if (s < 60)        snprintf(out, sz, "%us", (unsigned)s);
+  else if (s < 3600) snprintf(out, sz, "%um%02us", (unsigned)(s / 60), (unsigned)(s % 60));
+  else               snprintf(out, sz, "%uh%02um", (unsigned)(s / 3600), (unsigned)((s % 3600) / 60));
 }
 // 1234 -> "1.2k", 2345678 -> "2.3M"
 static void fmt_tok(long long v, char *out, int sz) {
@@ -718,13 +735,84 @@ static void handleTokensPost() {
   g_web->send(200, "application/json", "{\"ok\":true}");
   update_tok_row();
 }
+// ---- Endpoint de sessoes (hooks do Claude Code; ver tools/stick-notify.sh) ----
+// O handler NAO toca em objeto LVGL: so escreve na struct e levanta a flag.
+// O loop reconstroi os cards quando a ve. Isso mantem a resposta dentro do
+// timeout curtissimo do hook (curl -m 1) e evita destruir objetos no meio de
+// um scroll.
+static volatile bool g_sessDirty = false;
+
+// Extrai "chave":"valor" de um JSON simples. O payload vem do nosso proprio
+// script, que serializa com json.dumps — nao ha escapes exoticos a tratar.
+static bool jstr(const String &s, const char *key, char *out, size_t sz) {
+  String k = String("\"") + key + "\"";
+  int i = s.indexOf(k); if (i < 0) return false;
+  i = s.indexOf(':', i + k.length()); if (i < 0) return false;
+  i = s.indexOf('"', i);              if (i < 0) return false;
+  int j = s.indexOf('"', i + 1);      if (j < 0) return false;
+  int n = j - i - 1;
+  if (n <= 0) return false;
+  if ((size_t)n >= sz) n = (int)sz - 1;      // trunca no limite da struct
+  memcpy(out, s.c_str() + i + 1, n);
+  out[n] = 0;
+  return true;
+}
+static void handleSessionPost() {
+  String body = g_web->arg("plain");
+  char id[12] = {0}, project[24] = {0}, title[48] = {0}, host[24] = {0}, st[12] = {0};
+  if (!jstr(body, "id", id, sizeof(id)) || !jstr(body, "status", st, sizeof(st))) {
+    g_web->send(400, "application/json", "{\"error\":\"bad_request\"}");
+    return;
+  }
+  jstr(body, "project", project, sizeof(project));
+  jstr(body, "title", title, sizeof(title));
+  jstr(body, "host", host, sizeof(host));
+  uint64_t seq = (uint64_t)jll(body, "ts");   // "ts" vem primeiro no payload
+
+  bool changed;
+  if (!strcmp(st, "gone")) {
+    changed = sessionRemove(id);              // SessionEnd e sempre o ultimo: sem seq
+  } else {
+    SessStatus s;
+    if      (!strcmp(st, "working")) s = S_WORKING;
+    else if (!strcmp(st, "waiting")) s = S_WAITING;
+    else if (!strcmp(st, "done"))    s = S_DONE;
+    else { g_web->send(400, "application/json", "{\"error\":\"bad_status\"}"); return; }
+    changed = sessionUpsert(id, project, title, host, s, seq);
+  }
+  g_web->send(200, "application/json", "{\"ok\":true}");
+  if (changed) g_sessDirty = true;
+  Serial.printf("[SESS] %s %s (%s)\n", id, st, project);
+}
+
+// Espelho do estado interno — existe para depurar os hooks sem depender de
+// olhar a tela ("o evento chegou? com que status?").
+static void handleSessionGet() {
+  static const char *NAMES[4] = {"working", "waiting", "done", "stale"};
+  Session sn[MAX_SESSIONS];
+  uint8_t n = sessionsSnapshot(sn, MAX_SESSIONS);
+  String out = "{\"sessions\":[";
+  for (uint8_t i = 0; i < n; i++) {
+    char b[256];   // id+project+title+host+status no pior caso ~190
+    snprintf(b, sizeof(b),
+             "%s{\"id\":\"%s\",\"project\":\"%s\",\"title\":\"%s\",\"host\":\"%s\","
+             "\"status\":\"%s\",\"ago_s\":%lu}",
+             i ? "," : "", sn[i].id, sn[i].project, sn[i].title, sn[i].host,
+             NAMES[sn[i].status], (unsigned long)((millis() - sn[i].updatedAt) / 1000));
+    out += b;
+  }
+  out += "]}";
+  g_web->send(200, "application/json", out);
+}
+
 static void handleInfo() {
   String h = F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
                "<meta name=viewport content='width=device-width,initial-scale=1'>"
                "<title>Claude Usage Stick</title><style>" WEB_CSS "</style></head><body><div class=card>"
                "<h1>" WEB_SPARK " Claude Usage Stick</h1>"
-               "<p>Device online. Endpoints: <code>GET /window</code> (janela atual) e "
-               "<code>POST /tokens</code> (bridge de tokens por sessao — ver tools/token_bridge.py).</p>"
+               "<p>Device online. Endpoints: <code>GET /window</code> (janela atual), "
+               "<code>POST /tokens</code> (bridge de tokens por sessao — ver tools/token_bridge.py) e "
+               "<code>POST /session</code> (sessoes do Claude Code — ver tools/stick-notify.sh).</p>"
                "</div></body></html>");
   g_web->send(200, "text/html; charset=utf-8", h);
 }
@@ -735,6 +823,8 @@ static void start_data_web() {
   g_web->on("/", HTTP_GET, handleInfo);
   g_web->on("/window", HTTP_GET, handleWindow);
   g_web->on("/tokens", HTTP_POST, handleTokensPost);
+  g_web->on("/session", HTTP_POST, handleSessionPost);
+  g_web->on("/session", HTTP_GET, handleSessionGet);
   g_web->onNotFound([]() { g_web->send(404, "application/json", "{\"error\":\"not_found\"}"); });
   g_web->begin();
 }
@@ -1148,7 +1238,185 @@ static void build_tile_agora(lv_obj_t *t) {
   lv_obj_set_width(g_ui.agTok, 342);
   lv_obj_set_style_text_align(g_ui.agTok, LV_TEXT_ALIGN_RIGHT, 0);
 }
-// Tile 1 — MODELOS: Clawd oficial por modelo (humor animado) + sonda + incidentes.
+// Tile 1 — SESSOES: um card por sessao do Claude Code, cor por status.
+// A barra lateral colorida e quem carrega o estado: legivel de longe, sem foco.
+#define SESS_CARD_H 50
+#define SESS_GAP     5
+
+static uint32_t sess_color(SessStatus s) {
+  switch (s) {
+    case S_WORKING: return C_INFO;
+    case S_WAITING: return C_WARN;
+    case S_DONE:    return C_OK;
+    default:        return C_FAINT;   // S_STALE
+  }
+}
+static const char *sess_label(SessStatus s) {
+  switch (s) {
+    case S_WORKING: return TRS("trabalhando", "working");
+    case S_WAITING: return TRS("aguardando voce", "waiting for you");
+    case S_DONE:    return TRS("turno concluido", "turn done");
+    default:        return TRS("sem sinal ha 10min", "no signal for 10min");
+  }
+}
+
+// Reconstroi a lista inteira. So e chamada quando a composicao muda (evento
+// novo ou sweep de stale) — o contador de tempo vive no sessions_tick().
+static void sessions_rebuild() {
+  if (!g_ui.sessList) return;
+  lv_obj_clean(g_ui.sessList);
+  memset(g_ui.sessAgo, 0, sizeof(g_ui.sessAgo));
+  memset(g_ui.sessAt, 0, sizeof(g_ui.sessAt));
+
+  Session sn[MAX_SESSIONS];
+  uint8_t n = sessionsSnapshot(sn, MAX_SESSIONS);
+  g_ui.sessN = n;
+
+  if (g_ui.sessEmpty) {
+    if (n) lv_obj_add_flag(g_ui.sessEmpty, LV_OBJ_FLAG_HIDDEN);
+    else   lv_obj_clear_flag(g_ui.sessEmpty, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (g_ui.sessCount) {
+    char c[24];
+    if (n) snprintf(c, sizeof(c), n == 1 ? TRS("%d sessao", "%d session")
+                                         : TRS("%d sessoes", "%d sessions"), n);
+    else   c[0] = 0;
+    lv_label_set_text(g_ui.sessCount, c);
+  }
+  if (!n) return;
+
+  // host so aparece quando ha mais de uma maquina; id so quando dois cards
+  // disputam o mesmo nome de projeto (duas sessoes paralelas no mesmo repo)
+  bool multiHost = false;
+  for (uint8_t i = 1; i < n; i++)
+    if (strcmp(sn[i].host, sn[0].host)) { multiHost = true; break; }
+
+  for (uint8_t i = 0; i < n; i++) {
+    uint32_t col = sess_color(sn[i].status);
+
+    lv_obj_t *c = lv_obj_create(g_ui.sessList);
+    lv_obj_set_width(c, LV_PCT(100));
+    lv_obj_set_height(c, SESS_CARD_H);
+    lv_obj_set_style_bg_color(c, lv_color_hex(C_SURFACE), 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_radius(c, 12, 0);
+    lv_obj_set_style_pad_all(c, 0, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    if (sn[i].status == S_STALE) lv_obj_set_style_opa(c, 150, 0);
+
+    lv_obj_t *bar = rrect(c, 0, 0, 5, SESS_CARD_H, 3, col);
+    if (sn[i].status == S_WORKING) {          // pulse suave = Claude trabalhando
+      lv_anim_t a; lv_anim_init(&a);
+      lv_anim_set_var(&a, bar);
+      lv_anim_set_exec_cb(&a, anim_opa_cb);
+      lv_anim_set_values(&a, 90, 255);
+      lv_anim_set_duration(&a, 750);
+      lv_anim_set_playback_duration(&a, 750);
+      lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+      lv_anim_start(&a);
+    }
+
+    // linha de cima: titulo da sessao (o mesmo da barra lateral do Claude Code);
+    // sessao recem-aberta ainda nao tem titulo, cai no nome do repo
+    const char *head = sn[i].title[0] ? sn[i].title
+                     : (sn[i].project[0] ? sn[i].project : "?");
+    lv_obj_t *pr = mklabel(c, head, &lv_font_montserrat_18,
+                           sn[i].status == S_STALE ? C_MUTED : C_TEXT);
+    lv_obj_set_pos(pr, 16, 5);
+    // altura FIXA de uma linha: LV_LABEL_LONG_DOT quebra o texto e so poe as
+    // reticencias na ultima linha que couber na altura. Sem travar a altura,
+    // titulo longo vira duas linhas e encavala a linha de status.
+    lv_obj_set_size(pr, 330, lv_font_get_line_height(&lv_font_montserrat_18));
+    lv_label_set_long_mode(pr, LV_LABEL_LONG_DOT);
+
+    g_ui.sessAgo[i] = tlabel(c, &lv_font_montserrat_14, C_MUTED, 356, 9);
+    g_ui.sessAt[i]  = sn[i].updatedAt;
+    lv_obj_set_width(g_ui.sessAgo[i], 92);
+    lv_obj_set_style_text_align(g_ui.sessAgo[i], LV_TEXT_ALIGN_RIGHT, 0);
+
+    char sub[128];
+    strlcpy(sub, sess_label(sn[i].status), sizeof(sub));
+    // com titulo em cima o repo perderia-se, entao desce para ca (redundante
+    // quando nao ha titulo, porque ai o repo ja e a linha de cima)
+    if (sn[i].title[0] && sn[i].project[0]) {
+      strlcat(sub, " \xE2\x80\xA2 ", sizeof(sub));
+      strlcat(sub, sn[i].project, sizeof(sub));
+    }
+    bool dupProj = false;
+    for (uint8_t k = 0; k < n; k++)
+      if (k != i && !strcmp(sn[k].project, sn[i].project)) { dupProj = true; break; }
+    if (dupProj && sn[i].id[0]) {
+      strlcat(sub, " \xE2\x80\xA2 ", sizeof(sub));
+      strlcat(sub, sn[i].id, sizeof(sub));
+    }
+    if (multiHost && sn[i].host[0]) {
+      strlcat(sub, " \xE2\x80\xA2 ", sizeof(sub));
+      strlcat(sub, sn[i].host, sizeof(sub));
+    }
+    lv_obj_t *sl = mklabel(c, sub, &lv_font_montserrat_14, col);
+    lv_obj_set_pos(sl, 16, 28);
+    lv_obj_set_size(sl, 424, lv_font_get_line_height(&lv_font_montserrat_14));
+    lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
+  }
+  lv_obj_scroll_to_y(g_ui.sessList, 0, LV_ANIM_OFF);
+}
+
+// So os contadores de tempo (1s) — nao mexe na composicao da lista.
+static void sessions_tick() {
+  char a[16];
+  for (uint8_t i = 0; i < g_ui.sessN && i < MAX_SESSIONS; i++) {
+    if (!g_ui.sessAgo[i]) continue;
+    fmt_ago(g_ui.sessAt[i], a, sizeof(a));
+    lv_label_set_text(g_ui.sessAgo[i], a);
+  }
+}
+
+static void build_tile_sessions(lv_obj_t *t) {
+  tstatic(t, TRS("Sessoes do Claude Code", "Claude Code sessions"),
+          &lv_font_montserrat_16, C_TEXT, 14, 2);
+  g_ui.sessCount = tlabel(t, &lv_font_montserrat_12, C_FAINT, 340, 6);
+  lv_obj_set_width(g_ui.sessCount, 126);
+  lv_obj_set_style_text_align(g_ui.sessCount, LV_TEXT_ALIGN_RIGHT, 0);
+
+  // container rolavel: o tile nao rola (a tileview usa o arrasto horizontal),
+  // entao o scroll vertical mora aqui dentro e so no eixo Y
+  g_ui.sessList = lv_obj_create(t);
+  lv_obj_set_pos(g_ui.sessList, 8, 26);
+  lv_obj_set_size(g_ui.sessList, 464, 220);
+  lv_obj_set_style_bg_opa(g_ui.sessList, 0, 0);
+  lv_obj_set_style_border_width(g_ui.sessList, 0, 0);
+  lv_obj_set_style_pad_all(g_ui.sessList, 0, 0);
+  lv_obj_set_style_pad_row(g_ui.sessList, SESS_GAP, 0);
+  lv_obj_set_flex_flow(g_ui.sessList, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_scroll_dir(g_ui.sessList, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(g_ui.sessList, LV_SCROLLBAR_MODE_OFF);
+
+  // estado vazio: Clawd em repouso, nunca tela em branco
+  g_ui.sessEmpty = lv_obj_create(t);
+  lv_obj_set_pos(g_ui.sessEmpty, 8, 26);
+  lv_obj_set_size(g_ui.sessEmpty, 464, 220);
+  lv_obj_set_style_bg_opa(g_ui.sessEmpty, 0, 0);
+  lv_obj_set_style_border_width(g_ui.sessEmpty, 0, 0);
+  lv_obj_set_style_pad_all(g_ui.sessEmpty, 0, 0);
+  lv_obj_clear_flag(g_ui.sessEmpty, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *img = lv_image_create(g_ui.sessEmpty);
+  lv_image_set_src(img, &img_clawd_md);
+  lv_obj_set_style_image_recolor(img, lv_color_hex(0x6A6A74), 0);
+  lv_obj_set_style_image_recolor_opa(img, 150, 0);
+  lv_obj_align(img, LV_ALIGN_CENTER, 0, -34);
+  lv_obj_t *msg = mklabel(g_ui.sessEmpty, TRS("nenhuma sessao ativa", "no active sessions"),
+                          &lv_font_montserrat_16, C_MUTED);
+  lv_obj_align(msg, LV_ALIGN_CENTER, 0, 30);
+  lv_obj_t *hint = mklabel(g_ui.sessEmpty, TRS("instale os hooks: tools/stick-notify.sh",
+                                               "install the hooks: tools/stick-notify.sh"),
+                           &lv_font_montserrat_12, C_FAINT);
+  lv_obj_align(hint, LV_ALIGN_CENTER, 0, 54);
+
+  g_sessDirty = false;
+  sessions_rebuild();
+  sessions_tick();
+}
+// Tile 2 — MODELOS: Clawd oficial por modelo (humor animado) + sonda + incidentes.
 static void build_tile_models(lv_obj_t *t) {
   static const int CENTERS[NMODELS] = {60, 180, 300, 420};
   for (int i = 0; i < NMODELS; i++) {
@@ -1167,7 +1435,7 @@ static void build_tile_models(lv_obj_t *t) {
   lv_obj_set_width(g_ui.incident, 452);
   lv_label_set_long_mode(g_ui.incident, LV_LABEL_LONG_WRAP);
 }
-// Tile 2 — JANELA 5H: histórico + projeção pontilhada até esgotar.
+// Tile 3 — JANELA 5H: histórico + projeção pontilhada até esgotar.
 #define TR_X0 12
 #define TR_Y0 10
 #define TR_W  440
@@ -1225,7 +1493,7 @@ static void build_tile_trend(lv_obj_t *t) {
   lv_obj_set_width(g_ui.trCap, 452);
   lv_label_set_long_mode(g_ui.trCap, LV_LABEL_LONG_WRAP);
 }
-// Tile 3 — RITMO: heatmap por hora com filtro de período.
+// Tile 4 — RITMO: heatmap por hora com filtro de período.
 static void heat_btn_style() {
   const char *names[4] = {TRS("Hoje", "Today"), "7d", "30d", TRS("Tudo", "All")};
   for (int i = 0; i < 4; i++) {
@@ -1796,9 +2064,10 @@ static void ui_main() {
     tile_setup(g_ui.tile[i]);
   }
   build_tile_agora(g_ui.tile[0]);
-  build_tile_models(g_ui.tile[1]);
-  build_tile_trend(g_ui.tile[2]);
-  build_tile_heat(g_ui.tile[3]);
+  build_tile_sessions(g_ui.tile[1]);
+  build_tile_models(g_ui.tile[2]);
+  build_tile_trend(g_ui.tile[3]);
+  build_tile_heat(g_ui.tile[4]);
   lv_obj_add_event_cb(g_ui.tv, on_tile_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
   // Dots (objetos; o ativo vira pílula)
@@ -2065,6 +2334,13 @@ static void render_state() {
                                   g_usage.error[0] ? g_usage.error : TRS("sem dados", "no data"), C_BAD); break;
     default: break;
   }
+
+  // Os hooks de sessao fazem POST a qualquer momento — inclusive com o usuario
+  // parado em Ajustes ou numa tela de erro. Sem listener na :80 o evento se
+  // perde e o card fica com o status errado, entao qualquer tela que nao subiu
+  // servidor proprio ganha o de dados aqui (isso tambem mantem o mDNS vivo,
+  // via ensure_mdns()). ui_main/ui_token ja setaram g_web: no-op para elas.
+  if (!g_web && g_wifi.isConnected()) start_data_web();
 }
 
 // ============================================================
@@ -2162,6 +2438,7 @@ void setup() {
 
   load_persisted();
   apply_brightness();
+  sessionsInit();
 
   if (!LittleFS.begin(true)) Serial.println("LittleFS: falhou");
   else load_history();
@@ -2188,6 +2465,21 @@ void loop() {
     if (g_state == ST_TOKEN && g_tokenGot) { g_tokenGot = false; request_state(ST_SETUP_PIN); }
   }
 
+  // Sessoes: sweep de stale roda em qualquer tela (cobre o usuario que mata o
+  // terminal sem o SessionEnd disparar); o rebuild dos cards so no dashboard.
+  {
+    static uint32_t lastSweep = 0;
+    if (millis() - lastSweep > 30000) {
+      lastSweep = millis();
+      if (sessionsSweep()) g_sessDirty = true;
+    }
+  }
+  if (g_sessDirty && g_state == ST_MAIN && g_ui.sessList) {
+    g_sessDirty = false;
+    sessions_rebuild();
+    sessions_tick();
+  }
+
   if (g_dirty) {
     g_dirty = false;
     render_state();
@@ -2211,7 +2503,7 @@ void loop() {
     uint32_t now = millis();
     static uint32_t lastTick = 0, lastBar = 0, lastBob = 0, blinkAt = 0;
     static bool blinkClosed = false;
-    if (now - lastTick > 1000) { lastTick = now; dash_tick(); update_tok_row(); }
+    if (now - lastTick > 1000) { lastTick = now; dash_tick(); update_tok_row(); sessions_tick(); }
     if (now - lastBar > 250 && g_ui.refBar) {
       lastBar = now;
       int v;

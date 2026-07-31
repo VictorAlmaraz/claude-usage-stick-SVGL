@@ -39,7 +39,26 @@ next refresh — tapping it refreshes immediately.
 
 <br clear="right">
 
-### 2. Models (*Modelos*)
+### 2. Sessions (*Sessoes do Claude Code*)
+
+- One **card per running Claude Code session**, pushed from your Mac by
+  [hooks](#claude-code-sessions-hooks) — the Anthropic API does not expose sessions, so this is
+  local state.
+- A **colored side bar** carries the state, readable across the room without focusing:
+  🔵 **blue (pulsing)** `trabalhando` — Claude is working ·
+  🟡 **amber** `aguardando voce` — Claude is waiting on you ·
+  🟢 **green** `turno concluido` — turn finished ·
+  ⚪ **gray** `sem sinal ha 10min` — no event for 10 min (derived on-device, dimmed).
+- Sorted by **actionability**, not by time: `waiting → working → done → stale`. The card that
+  needs you is always in the same place — that is the whole point of glancing at the device.
+- Each card shows the **project** (basename of `cwd`) and **time since the last event**
+  (`2m14s`, `1h03m`). The 8-char session id only appears when two cards share a project name, and
+  the host only when more than one machine is reporting.
+- Up to 6 sessions (4 visible, scroll for the rest). Empty state shows a resting Clawd.
+
+<br clear="right">
+
+### 3. Models (*Modelos*)
 <img src="assets/mock-modelos.png" width="400" align="right" alt="Models screen">
 
 - The 4 Clawd mascots (Haiku / Sonnet / Opus / Fable) with a **live status pill** under each one,
@@ -50,7 +69,7 @@ next refresh — tapping it refreshes immediately.
 
 <br clear="right">
 
-### 3. 5-hour window (*Janela de 5h*)
+### 4. 5-hour window (*Janela de 5h*)
 <img src="assets/mock-janela5h.png" width="400" align="right" alt="5-hour window screen">
 
 - Custom chart with the **X axis spanning exactly the current 5 h window** (start → reset).
@@ -60,7 +79,7 @@ next refresh — tapping it refreshes immediately.
 
 <br clear="right">
 
-### 4. Hourly rhythm (*Ritmo por hora*)
+### 5. Hourly rhythm (*Ritmo por hora*)
 <img src="assets/mock-ritmo.png" width="400" align="right" alt="Hourly rhythm screen">
 
 - **Usage by hour of day**: 24 bars whose height/brightness show which hours burn the most quota;
@@ -166,8 +185,113 @@ python3 tools/token_bridge.py               # one shot
 python3 tools/token_bridge.py --loop 120    # keep pushing every 2 min
 ```
 
-The device advertises itself via mDNS as **`claude-stick.local`** while the dashboard is open. If
-the row disappears, the data just went stale (> 15 min without a push).
+The device advertises itself via mDNS as **`claude-stick.local`** and keeps the data server
+listening on **every screen** (not just the dashboard), so pushes never hit a closed port. It is
+a passive receiver: after a reboot its session list is empty and only refills as new hook events
+arrive — an idle session stays invisible until you touch it again. If the
+row disappears, the data just went stale (> 15 min without a push).
+
+### Claude Code sessions (hooks)
+
+The Sessions screen is fed by **Claude Code hooks** rather than polling. Polling
+`~/.claude/projects/**/*.jsonl` works but cannot tell `waiting` from `done` — in both cases the
+assistant turn simply ended. Hooks separate exactly those two states, and they push instead of
+poll:
+
+| Hook | Status sent | Meaning |
+|---|---|---|
+| `UserPromptSubmit` | `working` | you sent a prompt, Claude is working |
+| `PermissionRequest` | `waiting` | Claude is blocked on a permission decision |
+| `PostToolUse` | `working` | a tool ran, so Claude is going again |
+| `Notification` | `waiting` | idle prompt (Claude finished, you haven't replied) |
+| `Stop` | `done` | the turn finished |
+| `SessionEnd` | `gone` | removes the card |
+
+`PermissionRequest` — not `Notification` — is what fires when Claude asks for permission. This
+was **measured**, not read off the docs: a temporary hook logging raw stdin showed
+`PermissionRequest` firing and `Notification` staying silent. It is not noisy either — a
+read-only command auto-approved by the sandbox produces no event at all.
+
+`PostToolUse` exists only to undo the amber: without it a card stays "waiting" for the rest of
+the turn after you grant permission. It fires often, but a heartbeat that does not change the
+status causes **no redraw** — the device only rebuilds the card list when the composition or a
+status actually changes.
+
+**1. Install the script**
+
+```bash
+cp tools/stick-notify.sh ~/.claude/stick-notify.sh && chmod +x ~/.claude/stick-notify.sh
+```
+
+**No address to configure.** The script finds the device by mDNS and caches the IP in
+`/tmp/.stick-ip`, so it works at home and at the office without edits. When you change networks
+the cached IP fails, the cache is dropped and discovery re-runs — the event still gets delivered
+on that same attempt, not after a retry.
+
+The indirection is needed because macOS `getaddrinfo` takes ~2.8 s to resolve a `.local` name
+(it tries unicast DNS first), which blows the short timeout hooks require. `ping` resolves the
+same name in ~80 ms by talking to mDNSResponder directly, so the script resolves with `ping` and
+hands a bare IP to `curl`. Override with `CLAUDE_STICK_HOST` (fixed IP, skips discovery) or
+`CLAUDE_STICK_NAME` (different mDNS name).
+
+**2. Register the hooks** in `~/.claude/settings.json` (absolute paths — `~` is only expanded
+because the command runs through a shell, so do not rely on it):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "/Users/you/.claude/stick-notify.sh working", "async": true }] }],
+    "PermissionRequest": [{ "matcher": "*",
+                            "hooks": [{ "type": "command", "command": "/Users/you/.claude/stick-notify.sh waiting", "async": true }] }],
+    "PostToolUse":       [{ "matcher": "*",
+                            "hooks": [{ "type": "command", "command": "/Users/you/.claude/stick-notify.sh working", "async": true }] }],
+    "Notification":      [{ "matcher": "permission_prompt|idle_prompt",
+                            "hooks": [{ "type": "command", "command": "/Users/you/.claude/stick-notify.sh waiting", "async": true }] }],
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "/Users/you/.claude/stick-notify.sh done", "async": true }] }],
+    "SessionEnd":        [{ "hooks": [{ "type": "command", "command": "/Users/you/.claude/stick-notify.sh gone", "async": true }] }]
+  }
+}
+```
+
+The `Notification` **matcher matters**: without it every notification type (`auth_success`,
+`push_notification`, `computer_use_enter`, …) would turn a card amber.
+
+**The monitor must never block what it monitors.** Hooks are synchronous, so everything —
+including name resolution — happens inside a backgrounded block, `curl` is
+`--connect-timeout 1 -m 2`, and the script always `exit 0`. After a failure a **60-second
+circuit breaker** (`/tmp/.stick-down`) makes further hooks nearly free. Measured with the device
+unreachable: **0.15 s** for the failing call, **~10 ms** for each one after that. With the stick
+unplugged, Claude Code sees no delay and no error.
+
+Events sent while the device is off are **lost** — there is no queue, deliberately: replaying a
+20-minute-old "working" is worse than showing nothing.
+
+Every event carries a `ts` (the nanosecond the hook fired) and the device drops anything older
+than what it already has. Without it the last `PostToolUse` and the `Stop` — milliseconds apart,
+both racing in background `curl`s — can arrive swapped, leaving a finished session showing blue.
+
+Sub-agents are skipped (they share the parent's `session_id`, so a sub-agent `Stop` would mark
+your session done while Claude is still working).
+
+**3. The endpoints** — `POST /session` to push, `GET /session` to inspect. The `GET` is the
+debugging tool: it answers "did the event arrive, and with what status?" without squinting at the
+screen.
+
+```bash
+curl -X POST http://<device-ip>/session -H 'Content-Type: application/json' \
+  -d '{"id":"a1b2c3d4","project":"my-repo","title":"Fix the login race","status":"waiting","host":"my-mac"}'
+
+curl http://<device-ip>/session
+# {"sessions":[{"id":"a1b2c3d4","project":"my-repo","title":"Fix the login race",
+#                "host":"my-mac","status":"waiting","ago_s":3}]}
+```
+
+`status` is `working` | `waiting` | `done` | `gone`. Malformed payloads return `400`. Sessions are
+**never persisted** — they are ephemeral by definition, so a reboot clears the screen.
+
+> **Known gap:** nothing flips a card from `waiting` back to `working`. If Claude asks for
+> permission mid-turn, the card stays amber until `Stop`. Add `PostToolUse` → `working` as a
+> heartbeat if that bothers you — it costs one (backgrounded) invocation per tool call.
 
 ### Generating the token (`claude setup-token`)
 
@@ -288,6 +412,7 @@ firmware/
     api.cpp/.h                  # fetchUsage() — usage via API headers
     status.cpp/.h               # fetchModelStatus() — model health
     crypto.cpp/.h               # AES-256-GCM + PIN-derived key
+    sessions.cpp/.h             # sessoes do Claude Code (array estatico, efemero)
     certs.cpp/.h                # CA bundle for HTTPS
     wifi_manager.h              # networks saved in NVS (up to 3)
     touch.h                     # AXS15231B driver
@@ -297,6 +422,11 @@ firmware/
     build.sh                    # compile / flash / monitor
   bringup/                      # validated bring-up (hardware reference)
   REFERENCIA-HARDWARE-LVGL.md   # display/colors/touch that work
+tools/
+  token_bridge.py               # soma tokens dos transcripts -> POST /tokens
+  stick-notify.sh               # hooks do Claude Code -> POST /session
+  gen_logo_assets.py            # SVGs de marca -> imagens LVGL embutidas
+  gen_mockups.py                # mockups das telas para o README
 assets/                         # mockups das telas + assets de marca (brand/)
 3D Case/                        # case imprimível (STL) para a placa
 ```
@@ -309,7 +439,18 @@ assets/                         # mockups das telas + assets de marca (brand/)
 
 ---
 
-## Credits
+## Credits & license
 
-Fork of the original **Claude Usage Stick**. This version's firmware was rewritten for the
-ESP32-S3 480×320 LVGL screen. Not an official Anthropic product.
+This project is a fork twice over, and the chain matters:
+
+| | |
+|---|---|
+| **Original project** | [oauramos/claude-usage-stick](https://github.com/oauramos/claude-usage-stick) — the concept, the `anthropic-ratelimit-unified-*` header mechanics, the Clawd mascots, the multi-board firmware |
+| **ESP32-S3 / LVGL rewrite** | [benevid/claude-usage-stick-SVGL](https://github.com/benevid/claude-usage-stick-SVGL) by **Benevid Felix** — the entire touch firmware this repo builds on |
+| **This fork** | the Claude Code **sessions monitor** (screen, `POST /session`, hooks bridge) |
+
+Released under the [MIT License](LICENSE), matching the original. The upstream declares MIT in
+its README but ships no `LICENSE` file, so this fork adds one carrying the copyright of all
+three parties.
+
+Not an official Anthropic product. Clawd and the Claude Code wordmark belong to Anthropic.
