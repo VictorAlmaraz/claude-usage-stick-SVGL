@@ -805,6 +805,21 @@ static void handleSessionGet() {
   g_web->send(200, "application/json", out);
 }
 
+// Dump cru do framebuffer (RGB565, 320x480 — o canvas e retrato; a tela e
+// desenhada girada 90 graus por disp_flush_cb). Existe para as imagens do
+// README virem de pixels REAIS: mockups desenhados a mao divergem do firmware
+// com o tempo e usam outra fonte. Ver tools/grab_screen.py.
+static void handleScreenshot() {
+  if (!canvas_fb) { g_web->send(503, "text/plain", "no framebuffer"); return; }
+  const size_t n = 320UL * 480UL * sizeof(uint16_t);
+  g_web->setContentLength(n);
+  g_web->send(200, "application/octet-stream", "");
+  const char *p = (const char *)canvas_fb;
+  const size_t CHUNK = 4096;                 // nao cabe tudo de uma vez no TCP
+  for (size_t off = 0; off < n; off += CHUNK)
+    g_web->sendContent(p + off, (n - off < CHUNK) ? (n - off) : CHUNK);
+}
+
 static void handleInfo() {
   String h = F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
                "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -825,6 +840,7 @@ static void start_data_web() {
   g_web->on("/tokens", HTTP_POST, handleTokensPost);
   g_web->on("/session", HTTP_POST, handleSessionPost);
   g_web->on("/session", HTTP_GET, handleSessionGet);
+  g_web->on("/screenshot", HTTP_GET, handleScreenshot);
   g_web->onNotFound([]() { g_web->send(404, "application/json", "{\"error\":\"not_found\"}"); });
   g_web->begin();
 }

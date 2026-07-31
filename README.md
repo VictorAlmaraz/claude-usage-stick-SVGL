@@ -20,7 +20,11 @@ straight from the response headers, and renders it all on a friendly dashboard �
 
 ## Screens
 
-> The images below are **pixel-accurate mockups** of the v2.1 layout (real device photos coming soon). Regenerate them with `python3 tools/gen_mockups.py`.
+> The **Sessions** shot is a real capture off the device — `GET /screenshot` dumps the
+> framebuffer and [`tools/grab_screen.py`](tools/grab_screen.py) turns it into a PNG:
+> `python3 tools/grab_screen.py assets/screen-sessoes.png`. The rest are still hand-drawn
+> mockups (`python3 tools/gen_mockups.py`) and can drift from the firmware — they substitute
+> HelveticaNeue for LVGL's Montserrat. Prefer `grab_screen.py` for anything new.
 
 Navigate by **swiping** (the dots at the bottom show your position; the active one becomes a
 pill). The **gear** opens Settings. The thin **coral bar** below the header counts down to the
@@ -40,6 +44,7 @@ next refresh — tapping it refreshes immediately.
 <br clear="right">
 
 ### 2. Sessions (*Sessoes do Claude Code*)
+<img src="assets/screen-sessoes.png" width="400" align="right" alt="Sessions screen">
 
 - One **card per running Claude Code session**, pushed from your Mac by
   [hooks](#claude-code-sessions-hooks) — the Anthropic API does not expose sessions, so this is
@@ -289,6 +294,9 @@ curl http://<device-ip>/session
 `status` is `working` | `waiting` | `done` | `gone`. Malformed payloads return `400`. Sessions are
 **never persisted** — they are ephemeral by definition, so a reboot clears the screen.
 
+`GET /screenshot` returns the raw framebuffer (RGB565, 320x480, 300 KB) — the device is drawn
+rotated 90°, which `grab_screen.py` undoes.
+
 > **Known gap:** nothing flips a card from `waiting` back to `working`. If Claude asks for
 > permission mid-turn, the card stays amber until `Stop`. Add `PostToolUse` → `working` as a
 > heartbeat if that bothers you — it costs one (backgrounded) invocation per tool call.
@@ -426,7 +434,8 @@ tools/
   token_bridge.py               # soma tokens dos transcripts -> POST /tokens
   stick-notify.sh               # hooks do Claude Code -> POST /session
   gen_logo_assets.py            # SVGs de marca -> imagens LVGL embutidas
-  gen_mockups.py                # mockups das telas para o README
+  gen_mockups.py                # mockups desenhados a mao (legado)
+  grab_screen.py                # captura a tela REAL via GET /screenshot
 assets/                         # mockups das telas + assets de marca (brand/)
 3D Case/                        # case imprimível (STL) para a placa
 ```
