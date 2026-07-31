@@ -27,7 +27,13 @@
 # Entao: resolve com ping, guarda o IP em cache e usa o cache no caminho
 # rapido. Ao trocar de rede o IP em cache falha, o cache e invalidado e a
 # descoberta roda de novo — tudo dentro do bloco em background.
+# Quando o mDNS nao serve — rede corporativa que poe o device noutra VLAN, com
+# o multicast barrado entre elas — escreva o IP em ~/.claude/stick-host. Ele
+# vale mais que o cache e sobrevive a invalidacao, entao o device continua
+# alcancavel mesmo sem descoberta possivel. Apague o arquivo ao voltar para uma
+# rede onde o mDNS funciona.
 MDNS_NAME="${CLAUDE_STICK_NAME:-claude-stick.local}"
+PINNED="$HOME/.claude/stick-host"
 CACHE="/tmp/.stick-ip"
 BREAKER="/tmp/.stick-down"
 # Janela curta de proposito: o curl ja e background com --connect-timeout 1,
@@ -119,29 +125,33 @@ print(json.dumps({
       -H 'Content-Type: application/json' -d "$BODY"
   }
 
-  # 1) override explicito  2) IP em cache  3) descoberta por mDNS
-  TARGET="${CLAUDE_STICK_HOST:-$(cat "$CACHE" 2>/dev/null)}"
-  if [ -z "$TARGET" ]; then
-    TARGET=$(resolve_stick)
-    [ -n "$TARGET" ] && echo "$TARGET" > "$CACHE"
-  fi
+  # Tres candidatos, do mais barato ao mais caro. Nenhum e mandatorio: um
+  # endereco so vale enquanto responde, entao a falha de um sempre cai para o
+  # proximo, e a troca de rede se resolve no PRIMEIRO evento.
+  CAND_CACHE=$(cat "$CACHE" 2>/dev/null)
+  CAND_PIN="${CLAUDE_STICK_HOST:-$(cat "$PINNED" 2>/dev/null)}"
 
-  if post "$TARGET"; then
+  # 1) caminho rapido: o ultimo IP que funcionou
+  if [ -n "$CAND_CACHE" ] && post "$CAND_CACHE"; then
     exit 0
   fi
 
-  # Falhou: pode ser device desligado OU voce trocou de rede. Descarta o cache
-  # e tenta descobrir de novo — assim a mudanca de rede se resolve no PRIMEIRO
-  # evento, nao depois que o breaker expirar.
-  rm -f "$CACHE"
-  [ -n "$CLAUDE_STICK_HOST" ] && { touch "$BREAKER"; exit 0; }
-
-  FOUND=$(resolve_stick)
-  if [ -n "$FOUND" ] && [ "$FOUND" != "$TARGET" ] && post "$FOUND"; then
-    echo "$FOUND" > "$CACHE"
-  else
-    touch "$BREAKER"
+  # 2) IP fixado — para rede que poe o device noutra VLAN e barra o multicast
+  if [ -n "$CAND_PIN" ] && [ "$CAND_PIN" != "$CAND_CACHE" ] && post "$CAND_PIN"; then
+    echo "$CAND_PIN" > "$CACHE"
+    exit 0
   fi
+
+  # 3) descoberta por mDNS. Roda MESMO com IP fixado: um pin esquecido ao voltar
+  # para uma rede onde o mDNS funciona cegaria o bridge para sempre.
+  FOUND=$(resolve_stick)
+  if [ -n "$FOUND" ] && [ "$FOUND" != "$CAND_CACHE" ] && [ "$FOUND" != "$CAND_PIN" ] && post "$FOUND"; then
+    echo "$FOUND" > "$CACHE"
+    exit 0
+  fi
+
+  rm -f "$CACHE"
+  touch "$BREAKER"
 } >/dev/null 2>&1 &
 
 exit 0

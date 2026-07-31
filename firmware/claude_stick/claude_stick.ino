@@ -2346,8 +2346,21 @@ static void render_state() {
     case ST_MAIN:      ui_main(); break;
     case ST_SETTINGS:  ui_settings(); break;
     case ST_ABOUT:     ui_about(); break;
-    case ST_ERROR:     ui_message(TRS("Falha", "Failed"),
-                                  g_usage.error[0] ? g_usage.error : TRS("sem dados", "no data"), C_BAD); break;
+    case ST_ERROR: {
+      ui_message(TRS("Falha", "Failed"),
+                 g_usage.error[0] ? g_usage.error : TRS("sem dados", "no data"), C_BAD);
+      // Sem este botao a tela de erro e um beco sem saida: so se chega aqui com
+      // o WiFi associado (sem conexao o PIN ja manda para ST_WIFI), que e
+      // exatamente o caso de portal cativo — associado, mas a API nao responde.
+      // Trocar de rede ou de token exigiria reiniciar a placa.
+      lv_obj_t *b = mkbtn(lv_screen_active(),
+                          TRS(LV_SYMBOL_SETTINGS "  Ajustes", LV_SYMBOL_SETTINGS "  Settings"),
+                          &lv_font_montserrat_16, C_SURFACE2, C_TEXT);
+      lv_obj_set_size(b, 200, 48);
+      lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -30);
+      lv_obj_add_event_cb(b, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)ST_SETTINGS);
+      break;
+    }
     default: break;
   }
 

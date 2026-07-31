@@ -126,6 +126,11 @@ Opened from the gear (scrollable list, 44 px touch rows):
 - **About** — device info, display model and developer credits.
 - **Erase everything** — factory reset (2 taps to confirm).
 
+The error screen carries a **Settings** button too. You only land there with WiFi *associated*
+(without a connection the PIN screen routes straight to WiFi setup), which is exactly the
+captive-portal case — associated, but the API unreachable. Without that button, changing network
+or token would mean power-cycling the board.
+
 ---
 
 ## Hardware
@@ -228,16 +233,31 @@ status actually changes.
 cp tools/stick-notify.sh ~/.claude/stick-notify.sh && chmod +x ~/.claude/stick-notify.sh
 ```
 
-**No address to configure.** The script finds the device by mDNS and caches the IP in
-`/tmp/.stick-ip`, so it works at home and at the office without edits. When you change networks
-the cached IP fails, the cache is dropped and discovery re-runs — the event still gets delivered
-on that same attempt, not after a retry.
+**No address to configure.** The script tries three candidates in order, cheapest first:
 
-The indirection is needed because macOS `getaddrinfo` takes ~2.8 s to resolve a `.local` name
-(it tries unicast DNS first), which blows the short timeout hooks require. `ping` resolves the
-same name in ~80 ms by talking to mDNSResponder directly, so the script resolves with `ping` and
-hands a bare IP to `curl`. Override with `CLAUDE_STICK_HOST` (fixed IP, skips discovery) or
-`CLAUDE_STICK_NAME` (different mDNS name).
+| | | |
+|---|---|---|
+| 1 | `/tmp/.stick-ip` | the last IP that worked — the fast path |
+| 2 | `~/.claude/stick-host` | a pinned IP, for networks where mDNS cannot reach the device |
+| 3 | mDNS | discovery |
+
+**None of them is binding.** An address is only valid while it answers, so a failure always
+falls through to the next one and the delivery still happens on that same event — no lost
+notification, no waiting for the breaker. That matters in both directions: change networks and
+the stale cache self-corrects; forget a pinned IP behind and mDNS takes over instead of blinding
+the bridge forever.
+
+Discovery goes through `ping`, not `curl`, because macOS `getaddrinfo` takes ~2.8 s to resolve a
+`.local` name (it tries unicast DNS first) and that blows the short timeout hooks require;
+`ping` answers in ~80 ms by talking to mDNSResponder directly. The script resolves first and
+hands a bare IP to `curl`.
+
+**When to pin an IP.** Corporate and coworking networks often put devices on a separate VLAN.
+Routing still works — a WeWork setup measured here had the Mac on `10.14.120.x`, the stick on
+`10.14.89.x`, `HTTP 200` in 0.15 s — but multicast does not cross VLANs, so mDNS finds nothing.
+Write the IP into `~/.claude/stick-host` (read it off the serial console: the firmware logs
+`WiFi: connected to '<ssid>'! IP=<ip>` at boot). `CLAUDE_STICK_HOST` does the same for one
+session; `CLAUDE_STICK_NAME` changes the mDNS name.
 
 **2. Register the hooks** in `~/.claude/settings.json` (absolute paths — `~` is only expanded
 because the command runs through a shell, so do not rely on it):
