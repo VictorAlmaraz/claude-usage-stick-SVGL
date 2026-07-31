@@ -19,20 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-
----
-
-Attribution — this project is a fork twice over:
-
-  Original project      oauramos and contributors
-                        https://github.com/oauramos/claude-usage-stick
-
-  ESP32-S3 / LVGL       Benevid Felix
-  touch firmware        https://github.com/benevid/claude-usage-stick-SVGL
-
-  Claude Code           Victor Almaraz
-  sessions monitor      https://github.com/VictorAlmaraz/claude-usage-stick-SVGL
-
-The upstream project declares MIT in its README but ships no LICENSE file;
-this one carries the notice the license requires.

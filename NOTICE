@@ -1,0 +1,23 @@
+Claude Usage Stick — touch screen (ESP32-S3 + LVGL)
+
+This project is a fork twice over. All of it is MIT licensed (see LICENSE);
+this file records who wrote what.
+
+  Original project        oauramos and contributors
+                          https://github.com/oauramos/claude-usage-stick
+                          Concept, the anthropic-ratelimit-unified-* header
+                          mechanics, the Clawd mascots, multi-board firmware.
+
+  ESP32-S3 / LVGL         Benevid Felix
+  touch firmware          https://github.com/benevid/claude-usage-stick-SVGL
+                          The 480x320 touch UI this repository builds on.
+
+  Claude Code             Victor Almaraz
+  sessions monitor        https://github.com/VictorAlmaraz/claude-usage-stick-SVGL
+                          Sessions screen, POST/GET /session, hooks bridge.
+
+The upstream project declares MIT in its README but ships no LICENSE file,
+so this fork adds the notice the license requires.
+
+Not an official Anthropic product. Clawd and the Claude Code wordmark belong
+to Anthropic.
