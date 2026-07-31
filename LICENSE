@@ -1,11 +1,6 @@
 MIT License
 
-Copyright (c) 2026 oauramos and the Claude Usage Stick contributors
-  (original project: https://github.com/oauramos/claude-usage-stick)
-Copyright (c) 2026 Benevid Felix
-  (ESP32-S3 / LVGL touch firmware: https://github.com/benevid/claude-usage-stick-SVGL)
-Copyright (c) 2026 Victor Almaraz
-  (Claude Code sessions monitor)
+Copyright (c) 2026 oauramos and the Claude Usage Stick contributors, Benevid Felix, Victor Almaraz
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24,3 +19,20 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+---
+
+Attribution — this project is a fork twice over:
+
+  Original project      oauramos and contributors
+                        https://github.com/oauramos/claude-usage-stick
+
+  ESP32-S3 / LVGL       Benevid Felix
+  touch firmware        https://github.com/benevid/claude-usage-stick-SVGL
+
+  Claude Code           Victor Almaraz
+  sessions monitor      https://github.com/VictorAlmaraz/claude-usage-stick-SVGL
+
+The upstream project declares MIT in its README but ships no LICENSE file;
+this one carries the notice the license requires.
