@@ -450,7 +450,7 @@ This project is a fork twice over, and the chain matters:
 | **This fork** | the Claude Code **sessions monitor** (screen, `POST /session`, hooks bridge) |
 
 Released under the [MIT License](LICENSE), matching the original. The upstream declares MIT in
-its README but ships no `LICENSE` file, so this fork adds one carrying the copyright of all
-three parties.
+its README but ships no `LICENSE` file, so this fork adds one; [NOTICE](NOTICE) records who wrote
+what.
 
 Not an official Anthropic product. Clawd and the Claude Code wordmark belong to Anthropic.
