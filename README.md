@@ -414,8 +414,10 @@ On every subsequent boot, the device only asks for the **PIN** to decrypt the to
 
 - The token is stored **encrypted** (AES-256-GCM; key derived from the PIN via SHA-256). The PIN
   is **never** stored — a wrong PIN means the GCM tag fails to verify.
-- After 10 wrong attempts, the credentials are **wiped** and the device returns to onboarding
-  (each failure doubles the lockout time).
+- After 10 wrong attempts, the credentials are **wiped** and the device returns to onboarding.
+  Each failure adds 5 s to the lockout (5 s, 10 s, 15 s …). The ceiling against brute force is
+  the wipe, not the wait — a doubling step mostly punished the owner, who is the one actually
+  fat-fingering the PIN.
 - The history/heatmap lives in a **LittleFS** file (it does not contain the token).
 - `.env` and `.mcp.json` are in `.gitignore` — **no secrets go to git**.
 

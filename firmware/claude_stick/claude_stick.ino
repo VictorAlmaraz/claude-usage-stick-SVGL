@@ -427,8 +427,10 @@ static void pin_submit() {
       request_state(ST_WIFI);
       return;
     }
-    int wait = LOCKOUT_BASE_SEC * (1 << (g_pinAttempts - 1));
-    if (wait > 3600) wait = 3600;
+    // Progressao linear (5s, 10s, 15s...), e nao exponencial: quem erra o PIN
+    // e voce, e o teto real contra forca bruta e o wipe em MAX_PIN_ATTEMPTS —
+    // nao a espera. Com o passo dobrando, o 3o erro ja custava 4 minutos.
+    int wait = LOCKOUT_STEP_SEC * g_pinAttempts;
     g_lockoutUntil = millis() + (uint32_t)wait * 1000;
     if (g_pinMsg) {
       char m[64];

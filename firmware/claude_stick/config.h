@@ -40,7 +40,7 @@
 // ── Segurança (PIN + AES-256-GCM) ────────────────────────
 #define PIN_LEN                 4
 #define MAX_PIN_ATTEMPTS        10
-#define LOCKOUT_BASE_SEC        60       // dobra a cada falha
+#define LOCKOUT_STEP_SEC        5        // soma a cada falha: 5s, 10s, 15s...
 #define KDF_ROUNDS              10000
 
 // ── Rede / API Claude ────────────────────────────────────
