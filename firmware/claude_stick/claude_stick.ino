@@ -2494,6 +2494,21 @@ void loop() {
     if (g_state == ST_TOKEN && g_tokenGot) { g_tokenGot = false; request_state(ST_SETUP_PIN); }
   }
 
+  // Anuncio do IP pela USB, em qualquer tela. Quem le e o stick-notify.sh, e
+  // so quando o cache dele falha — o custo aqui e um printf a cada 5s.
+  //
+  // Periodico, e nao sob demanda: responder a um comando exigiria que o host
+  // abrisse a porta para ESCRITA, e o ROM USB-Serial-JTAG do S3 entra em
+  // download mode por DTR/RTS (e por isso que o flash.sh grava sem pedir BOOT).
+  // Um reset disparado por hook cairia na tela de PIN no meio da sessao.
+  {
+    static uint32_t lastNet = 0;
+    if (millis() - lastNet > 5000) {
+      lastNet = millis();
+      g_wifi.announceIP();
+    }
+  }
+
   // Sessoes: sweep de stale roda em qualquer tela (cobre o usuario que mata o
   // terminal sem o SessionEnd disparar); o rebuild dos cards so no dashboard.
   {

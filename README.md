@@ -233,31 +233,47 @@ status actually changes.
 cp tools/stick-notify.sh ~/.claude/stick-notify.sh && chmod +x ~/.claude/stick-notify.sh
 ```
 
-**No address to configure.** The script tries three candidates in order, cheapest first:
+**No address to configure.** The script tries four candidates in order, cheapest first:
 
 | | | |
 |---|---|---|
 | 1 | `/tmp/.stick-ip` | the last IP that worked — the fast path |
-| 2 | `~/.claude/stick-host` | a pinned IP, for networks where mDNS cannot reach the device |
-| 3 | mDNS | discovery |
+| 2 | USB serial | the device announcing its own IP over the cable |
+| 3 | `~/.claude/stick-host` | a pinned IP, for a device on the network with neither cable nor mDNS |
+| 4 | mDNS | discovery |
 
 **None of them is binding.** An address is only valid while it answers, so a failure always
 falls through to the next one and the delivery still happens on that same event — no lost
 notification, no waiting for the breaker. That matters in both directions: change networks and
-the stale cache self-corrects; forget a pinned IP behind and mDNS takes over instead of blinding
-the bridge forever.
+the stale cache self-corrects; forget a pinned IP behind and the cable or mDNS takes over
+instead of blinding the bridge forever. A candidate only counts as delivered on `HTTP 2xx` —
+any other answer is some *other* host that inherited the lease, and caching it would poison the
+highest-priority candidate.
 
-Discovery goes through `ping`, not `curl`, because macOS `getaddrinfo` takes ~2.8 s to resolve a
-`.local` name (it tries unicast DNS first) and that blows the short timeout hooks require;
-`ping` answers in ~80 ms by talking to mDNSResponder directly. The script resolves first and
-hands a bare IP to `curl`.
+mDNS discovery goes through `ping`, not `curl`, because macOS `getaddrinfo` takes ~2.8 s to
+resolve a `.local` name (it tries unicast DNS first) and that blows the short timeout hooks
+require; `ping` answers in ~80 ms by talking to mDNSResponder directly. The script resolves
+first and hands a bare IP to `curl`.
 
-**When to pin an IP.** Corporate and coworking networks often put devices on a separate VLAN.
-Routing still works — a WeWork setup measured here had the Mac on `10.14.120.x`, the stick on
-`10.14.89.x`, `HTTP 200` in 0.15 s — but multicast does not cross VLANs, so mDNS finds nothing.
-Write the IP into `~/.claude/stick-host` (read it off the serial console: the firmware logs
-`WiFi: connected to '<ssid>'! IP=<ip>` at boot). `CLAUDE_STICK_HOST` does the same for one
-session; `CLAUDE_STICK_NAME` changes the mDNS name.
+**Why the cable ranks above both.** Corporate and coworking networks often put devices on a
+separate VLAN. Routing still works — a WeWork setup measured here had the Mac on `10.14.120.x`,
+the stick on `10.14.89.x`, `HTTP 200` in 0.15 s — but multicast does not cross VLANs, so mDNS
+finds nothing. What is missing there is not reach, it is *discovery*. So the firmware announces
+`[NET] ip=<ip>` on serial every 5 s, and the script reads it straight off the port: the only
+candidate DHCP cannot invalidate, and it carries identity for free — the address came from the
+device itself, not from a name any host on the network could have answered.
+
+It is read-only by design. Asking the device on demand would mean opening the port for
+**writing**, and the ESP32-S3 USB-Serial-JTAG ROM enters download mode via DTR/RTS — which is
+exactly why `flash.sh` uploads without asking you to hold BOOT. A hook-triggered reset would
+land on the PIN screen mid-session. A 5 s wait costs nothing because discovery already runs in
+the background block.
+
+**When to pin an IP.** Only when the stick is on the network but out of reach of both — on a
+charger instead of the Mac, on a foreign VLAN. Write the IP into `~/.claude/stick-host`; read it
+off **Settings → Change token**, which shows `http://<ip>` on screen. `CLAUDE_STICK_HOST` does
+the same for one session; `CLAUDE_STICK_NAME` changes the mDNS name. The pin is manual and rots
+on its own when the lease changes, so it is the last resort, not the first.
 
 **2. Register the hooks** in `~/.claude/settings.json` (absolute paths — `~` is only expanded
 because the command runs through a shell, so do not rely on it):

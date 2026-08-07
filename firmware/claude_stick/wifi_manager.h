@@ -37,6 +37,7 @@ public:
             if (WiFi.status() == WL_CONNECTED) {
                 Serial.printf("WiFi: connected to '%s'! IP=%s\n",
                     _nets[i].ssid, WiFi.localIP().toString().c_str());
+                announceIP();
                 if (i > 0) _promote(i);
                 return true;
             }
@@ -57,6 +58,7 @@ public:
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("WiFi: connected! IP=%s\n", WiFi.localIP().toString().c_str());
+            announceIP();
             _addNetwork(ssid, pass);
             return true;
         }
@@ -80,6 +82,18 @@ public:
 
     bool isConnected() { return WiFi.status() == WL_CONNECTED; }
     String getIP() { return WiFi.localIP().toString(); }
+
+    // Anuncia o IP pela USB, num marcador unico e estavel. E o canal de
+    // descoberta de quem esta do outro lado do cabo (tools/stick-notify.sh):
+    // em rede de coworking o mDNS nao atravessa a VLAN, e o host nao tem como
+    // adivinhar o IP quando o DHCP troca o lease.
+    //
+    // O cabo tambem e a prova de identidade — o IP veio do device, e nao de um
+    // nome que qualquer host da rede poderia ter respondido.
+    void announceIP() {
+        if (!isConnected()) return;
+        Serial.printf("[NET] ip=%s\n", WiFi.localIP().toString().c_str());
+    }
     String getSSID() { return WiFi.SSID(); }
 
     String getSavedSSID() {
