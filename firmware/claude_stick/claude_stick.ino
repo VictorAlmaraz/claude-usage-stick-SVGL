@@ -2100,6 +2100,16 @@ static void ui_main() {
   }
 
   refresh_ui_values();
+
+  // A tileview nasce SEM tile ativo: lv_tileview_add_tile() nao escreve
+  // tile_act, que so e preenchido no SCROLL_END ou por set_tile. Sem isto o
+  // on_tile_changed abaixo compara todos os tiles com NULL, nenhum casa, e os
+  // dots ficam todos apagados ate o primeiro swipe — e de novo a cada rebuild
+  // do dashboard (volta dos ajustes, passagem pelo loading).
+  //
+  // Fixar o tile 0 tambem ressincroniza g_curTile com o que esta na tela: ele
+  // sobrevive ao rebuild, e o slideshow parte de (g_curTile + 1).
+  lv_tileview_set_tile_by_index(g_ui.tv, 0, 0, LV_ANIM_OFF);
   on_tile_changed(NULL);
 }
 
